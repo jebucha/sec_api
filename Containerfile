@@ -1,9 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # --- Builder: install the project and its dependencies with uv ---------------
-FROM python:3.13 AS builder
+FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim AS builder
 
-RUN pip install --no-cache-dir uv
 WORKDIR /app
 
 # Dependencies first (uv.lock pins exact versions; --frozen fails on drift).
@@ -17,7 +16,7 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
 # --- Runtime: slim image, non-root, healthcheck on /healthz ------------------
-FROM python:3.13-slim
+FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim
 
 RUN groupadd --system llmgw \
     && useradd --system --gid llmgw --home-dir /app llmgw \

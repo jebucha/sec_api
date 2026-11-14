@@ -89,9 +89,10 @@ Put the `token_sha256` in `clients`. Clients may send the token as
 
 ## Container deployment (podman)
 
-The `Containerfile` is two stages: a `python:3.13` builder that installs the
-project and dependencies with `uv` (frozen, from `uv.lock`), then a
-`python:3.13-slim` runtime that runs as the non-root `llmgw` user. It works
+The `Containerfile` is two stages: a `ghcr.io/astral-sh/uv:python3.13-trixie-slim`
+builder (`uv` preinstalled) that installs the project and dependencies with
+`uv` (frozen, from `uv.lock`), then a runtime on the same image that runs as
+the non-root `llmgw` user. It works
 with `podman build` and `docker build`:
 
 ```bash
