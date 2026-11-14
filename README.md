@@ -96,8 +96,14 @@ the non-root `llmgw` user. It works
 with `podman build` and `docker build`:
 
 ```bash
-podman build -t sec-api-gateway .
+podman build --format docker -t sec-api-gateway .
 ```
+
+Use `--format docker`: podman's default OCI image format has no home for the
+`HEALTHCHECK` instruction and drops it with a warning, so a container run
+directly with `podman run` would not be probed. `podman compose` builds may
+still print that warning, but it is harmless there — the service-level
+`healthcheck` in `compose.yaml` applies the same probe.
 
 Before bringing the stack up, edit:
 

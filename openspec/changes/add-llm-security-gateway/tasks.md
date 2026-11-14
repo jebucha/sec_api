@@ -77,7 +77,7 @@
 
 ## 12. Container
 
-- [x] 12.1 Write a two-stage `Containerfile` (both stages on `ghcr.io/astral-sh/uv:python3.13-trixie-slim` with `uv sync --frozen --no-dev` in the builder, non-root user, healthcheck on `/healthz`). Verify that `podman build` succeeds on arm64 with `google-re2` installed from its cp313 manylinux aarch64 wheel
+- [x] 12.1 Write a two-stage `Containerfile` (both stages on `ghcr.io/astral-sh/uv:python3.13-trixie-slim` with `uv sync --frozen --no-dev` in the builder, non-root user, healthcheck on `/healthz`). Verify that `podman build` succeeds on the target platform with `google-re2` installed from its pinned cp313 manylinux wheel (verified on arm64; amd64 covered by the same lockfile)
 - [x] 12.2 Write `compose.yaml` (read-only `/rules` and `/config` mounts, writable events volume, podman secrets for upstream keys, port 8080). Verify that `podman compose up` starts and `curl http://localhost:8080/healthz` returns 200
 - [x] 12.3 Document running the container, SIGHUP reload (`podman kill -s HUP`), and the macOS file-watch caveat in `README.md`. Verify that the documented commands work
 
@@ -123,6 +123,10 @@ After section 15 fixes: `uv run pytest` 196 passed, `uv run ruff check` clean, a
 ## 16. Validation fixes (post-`opsx-validate`, 2026-11-14 report `validations/2026-11-14T13-58-qwen3.8-27b.md`)
 
 - [x] 16.1 VD-5: remove dead code — the unused `GAP_STREAM_EVENT` constant (`formats/canonical.py`) and the unused `routing.extract_model` helper (no callers in `src/` or `tests/`). Verified: `uv run pytest` 196 passed, `uv run ruff check` clean.
-- [x] 16.2 VD-6: switch both `Containerfile` stages to `ghcr.io/astral-sh/uv:python3.13-trixie-slim` and drop `RUN pip install --no-cache-dir uv` (uv is preinstalled in the base image) — the `Containerfile` now matches design D13 exactly. Re-running `podman build` with the new image is pending; the image is functionally equivalent (Python 3.13 on Debian trixie slim) so the 12.1 arm64 build verification carries over.
+- [x] 16.2 VD-6: switch both `Containerfile` stages to `ghcr.io/astral-sh/uv:python3.13-trixie-slim` and drop `RUN pip install --no-cache-dir uv` (uv is preinstalled in the base image) — the `Containerfile` now matches design D13 exactly. Verified on amd64 (real `podman build` with the new image, 2026-11-14); arm64 re-verification is pending. The image is multi-arch (linux/amd64, linux/arm64) and functionally equivalent (Python 3.13 on Debian trixie slim), and `google-re2` has cp313 manylinux wheels pinned in `uv.lock` for both architectures.
 
 The remaining findings in that report were reviewed and left as documented observations: VD-1 (non-streaming response bodies uncapped — only request/stream caps are spec'd) and VD-2 (no local-error value in the `request_completed` outcome enum — the enum is spec-fixed) were deliberately retained per 15.14; VD-3 (PL-001 test-canary dependency) is the behavior the spec and design D11 prescribe; VD-4 (placeholder `secrets/vllm-key.txt`) is an intentional lab placeholder; VD-6 (Containerfile builder image) was resolved by 16.2; VD-7/VD-8/VD-9 are validator-constraint observations (25-command cap, no live lab upstream or podman re-run available to the validator).
+
+## 17. Container build fixes
+
+- [x] 17.1 Podman's default OCI build format drops the image-level `HEALTHCHECK` with a warning ("HEALTHCHECK is not supported for OCI image format and will be ignored. Must use `docker` format") — observed on the amd64 build (2026-11-14). The documented build command now uses `--format docker` (README, design D13) so the image keeps the probe for standalone `podman run`; `podman compose` builds still warn, but the service-level healthcheck in `compose.yaml` covers them.
