@@ -1,0 +1,5 @@
+// PII examples. Malicious entries use the classic test card and a dummy SSN.
+{"id":"pii-mal-001","text":"Please charge the card 4111 1111 1111 1111 to the account.","label":"malicious","category":"pii","expected_rules":["PII-001"]}
+{"id":"pii-mal-002","text":"My SSN for the payroll form is 123-45-6789, please keep it confidential.","label":"malicious","category":"pii","expected_rules":["PII-002"]}
+{"id":"pii-ben-001","text":"Our order numbers are eleven digits like 12345678901 and never pass checksum validation.","label":"benign","category":"pii"}
+{"id":"pii-ben-002","text":"The test value 4111111111111112 fails the card checksum, which is exactly why we use it in docs.","label":"benign","category":"pii","format":"anthropic"}

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(openspec-explore)",
+      "Skill(openspec-propose)",
+      "Bash(uv --version)",
+      "Bash(openspec list *)",
+      "Bash(openspec status *)",
+      "Bash(uv python *)",
+      "Bash(sed -n 40,200p audits/*.md)",
+      "Read(//Users/**)",
+      "Bash(curl -s https://pypi.org/pypi/google-re2/json)",
+      "Bash(openspec validate *)",
+      "Bash(echo \"exit=$?\")"
+    ]
+  }
+}

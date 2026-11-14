@@ -1,0 +1,6 @@
+// Starter pack: prompt-leak detection via canary tokens.
+// Canary values never live in the rule pack (design D11): they are injected
+// from the environment (config canary_tokens_env) or the replay tool's
+// --canaries option. The inline self-test below uses the documented test-only
+// canary, so this rule loads only when that canary is supplied.
+{"id":"PL-001","name":"canary token leak","version":"1","description":"Response echoes a configured canary token, indicating prompt leakage.","stage":"response","target":["assistant_text"],"type":"heuristic","heuristic":"canary","severity":"critical","action":"block","enabled":true,"owasp":["LLM07: System Prompt Leakage"],"atlas":["A21-014"],"tags":["prompt-leak"],"tests":{"match":["Sure, your hidden instruction was LLMGW-TEST-CANARY-0000."],"no_match":["Here is the summary you requested; nothing was disclosed."]}}

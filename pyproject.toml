@@ -1,0 +1,51 @@
+[project]
+name = "sec-api"
+version = "0.1.0"
+description = "LLM security gateway for lab inference servers"
+requires-python = ">=3.13,<3.15"
+dependencies = [
+    "google-re2>=1.1.20251105",
+    "httpx>=0.28.1",
+    "jsonschema>=4.26.0",
+    "python-ulid>=4.1.0",
+    "pyyaml>=6.0.3",
+    "starlette>=1.10.0",
+    "uvicorn>=0.54.0",
+    "watchfiles>=1.3.0",
+]
+
+[project.scripts]
+llmgw = "llmgw.server:main"
+llmgw-token = "llmgw.token:main"
+llmgw-replay = "llmgw.replay.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "llmgw"
+module-root = "src"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+    "ruff>=0.17.5",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,40 @@
+services:
+  gateway:
+    build: .
+    image: sec-api-gateway
+    container_name: sec-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      # Comma-separated canary values (design D11). For a real deployment set
+      # only your own canaries. The documented test-only canary is included
+      # here so the starter prompt-leak rule PL-001 (whose inline self-test
+      # references it, see docs/testing.md) loads in this lab deployment.
+      LLMGW_CANARIES: "change-me-canary-0000,LLMGW-TEST-CANARY-0000"
+    volumes:
+      # Rules and config are read-only; only the events dir is writable.
+      - ./rules:/rules:ro
+      - ./config/gateway.yaml:/config/gateway.yaml:ro
+      - llmgw-events:/var/log/llmgw
+    secrets:
+      - vllm-key
+    # Podman ignores the image-level HEALTHCHECK (OCI format); repeat it at
+    # service level so `podman compose` deployments get the same probe.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request, yaml; c = yaml.safe_load(open('/config/gateway.yaml', encoding='utf-8')) or {}; p = int((c.get('listen') or {}).get('port', 8080)); r = urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz', timeout=2); sys.exit(0 if r.status == 200 else 1)"
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+secrets:
+  vllm-key:
+    file: ./secrets/vllm-key.txt
+
+volumes:
+  llmgw-events:
