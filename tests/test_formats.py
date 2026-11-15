@@ -19,6 +19,7 @@ from llmgw.formats.canonical import (
     GAP_TOOL_RESULT,
     GAP_UNKNOWN_PART,
     Canonical,
+    tool_call_segment,
 )
 
 
@@ -133,6 +134,30 @@ def test_response_text_in_assistant_text():
     assert anthropic.parse_response(ant_body).assistant_text == ("hello",)
 
 
+# --- tool-call segment builder (1.1) ------------------------------------------
+
+def test_tool_call_segment_name_and_object():
+    """1.1: one JSON object per call with the call's name and parsed input."""
+    segment = tool_call_segment("shell", '{"command": "ls", "count": 2}')
+    assert json.loads(segment) == {"input": {"command": "ls", "count": 2}, "name": "shell"}
+    # Anthropic-style input objects pass through unchanged
+    assert tool_call_segment("shell", {"command": "ls", "count": 2}) == segment
+
+
+def test_tool_call_segment_serialization_is_deterministic():
+    """1.1: sort_keys serialization, stable regardless of argument key order."""
+    a = tool_call_segment("shell", '{"command": "ls", "count": 2}')
+    b = tool_call_segment("shell", '{"count": 2, "command": "ls"}')
+    assert a == b == '{"input": {"command": "ls", "count": 2}, "name": "shell"}'
+
+
+def test_tool_call_segment_unparseable_arguments_fallback():
+    """1.1: a raw arguments string that does not parse stays the input."""
+    raw = "not-json: {oops"
+    segment = tool_call_segment("shell", raw)
+    assert json.loads(segment) == {"input": raw, "name": "shell"}
+
+
 # --- duplicate JSON keys -------------------------------------------------------
 
 def test_duplicate_top_level_key_rejected_400():
@@ -166,8 +191,8 @@ def test_invalid_json_raises_format_error():
 
 # --- uninspected content --------------------------------------------------------
 
-def test_tool_blocks_emit_uninspected_content_event():
-    """T-CONTENT-NORMALIZATION-009: tool_use/tool_result/tool_calls become gaps."""
+def test_tool_blocks_no_longer_emit_uninspected_events():
+    """T-CONTENT-NORMALIZATION-009: well-formed tool content is inspected, not gapped."""
     ant = _ant(
         {
             "messages": [
@@ -191,9 +216,12 @@ def test_tool_blocks_emit_uninspected_content_event():
             ]
         }
     )
-    kinds = [gap.kind for gap in ant.uninspected]
-    assert GAP_TOOL_CALL in kinds
-    assert GAP_TOOL_RESULT in kinds
+    assert not any(
+        gap.kind in (GAP_TOOL_CALL, GAP_TOOL_RESULT) for gap in ant.uninspected
+    )
+    assert ant.assistant_text == ("calling a tool",)
+    assert ant.tool_calls == (tool_call_segment("search", {}),)
+    assert ant.tool_results == ("result text",)
 
     oai = _oai(
         {
@@ -207,9 +235,140 @@ def test_tool_blocks_emit_uninspected_content_event():
             ]
         }
     )
-    oai_kinds = [gap.kind for gap in oai.uninspected]
-    assert GAP_TOOL_CALL in oai_kinds
-    assert GAP_TOOL_RESULT in oai_kinds
+    assert not any(
+        gap.kind in (GAP_TOOL_CALL, GAP_TOOL_RESULT) for gap in oai.uninspected
+    )
+    assert oai.tool_calls == (tool_call_segment("f", None),)
+    assert oai.tool_results == ("out",)
+
+
+def test_openai_request_tool_calls_extracted():
+    """T-CONTENT-NORMALIZATION-016: one tool_calls segment per entry."""
+    c = _oai(
+        {
+            "messages": [
+                {"role": "user", "content": "ls the repo"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": '{"command": "ls"}'},
+                        },
+                        {
+                            "id": "c2",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": '{"path": "a.txt"}'},
+                        },
+                    ],
+                },
+            ]
+        }
+    )
+    assert c.tool_calls == (
+        tool_call_segment("shell", '{"command": "ls"}'),
+        tool_call_segment("read", '{"path": "a.txt"}'),
+    )
+    assert not c.uninspected
+
+
+def test_anthropic_request_tool_use_extracted():
+    """T-CONTENT-NORMALIZATION-017: one tool_calls segment per tool_use block."""
+    c = _ant(
+        {
+            "messages": [
+                {"role": "user", "content": "ls the repo"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "shell",
+                            "input": {"command": "ls"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "t2",
+                            "name": "read",
+                            "input": {"path": "a.txt"},
+                        },
+                    ],
+                },
+            ]
+        }
+    )
+    assert c.tool_calls == (
+        tool_call_segment("shell", {"command": "ls"}),
+        tool_call_segment("read", {"path": "a.txt"}),
+    )
+    assert not c.uninspected
+
+
+def test_openai_tool_result_messages_extracted():
+    """T-CONTENT-NORMALIZATION-021: string content of role: tool messages is a segment."""
+    c = _oai(
+        {
+            "messages": [
+                {"role": "tool", "tool_call_id": "c1", "content": "file one"},
+                {"role": "tool", "tool_call_id": "c2", "content": "file two"},
+            ]
+        }
+    )
+    assert c.tool_results == ("file one", "file two")
+    assert not c.uninspected
+
+
+def test_anthropic_tool_result_blocks_extracted():
+    """T-CONTENT-NORMALIZATION-022: text parts are segments, image parts stay gaps."""
+    c = _ant(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t1",
+                            "content": "plain result",
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "t2",
+                            "content": [
+                                {"type": "text", "text": "part one"},
+                                {"type": "image", "source": {}},
+                                {"type": "text", "text": "part two"},
+                            ],
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+    assert c.tool_results == ("plain result", "part one", "part two")
+    assert [gap.kind for gap in c.uninspected] == [GAP_IMAGE]
+
+
+def test_response_tool_calls_extracted():
+    """T-CONTENT-NORMALIZATION-018: response-stage tool calls, both formats."""
+    oai = openai.parse_response(
+        b'{"choices":[{"message":{"content":null,"tool_calls":'
+        b'[{"id":"c1","type":"function",'
+        b'"function":{"name":"shell","arguments":"{\\"command\\": \\"ls\\"}"}}]}}]}'
+    )
+    assert oai.tool_calls == (tool_call_segment("shell", {"command": "ls"}),)
+    assert not oai.uninspected
+
+    ant = anthropic.parse_response(
+        b'{"content":[{"type":"text","text":"calling"},'
+        b'{"type":"tool_use","id":"t1","name":"shell","input":{"command":"ls"}}]}'
+    )
+    assert ant.assistant_text == ("calling",)
+    assert ant.tool_calls == (tool_call_segment("shell", {"command": "ls"}),)
+    assert not ant.uninspected
 
 
 def test_tool_definitions_emit_uninspected_content_event():
@@ -249,7 +408,8 @@ def test_unknown_part_type_recorded_uninspected():
 
 
 def test_tool_call_gap_locations_are_positional():
-    """VD-2: tool_calls gaps use positional indexes, never raw call content."""
+    """VD-2: malformed tool content gaps use positional indexes, never raw call
+    content. Well-formed entries are inspected segments, not gaps."""
     raw_args = "SECRET-RAW-ARGS-THAT-MUST-NOT-LEAK"
     oai = _oai(
         {
@@ -263,20 +423,24 @@ def test_tool_call_gap_locations_are_positional():
                             "type": "function",
                             "function": {"name": "f", "arguments": raw_args},
                         },
-                        {
-                            "id": "c2",
-                            "type": "function",
-                            "function": {"name": "g", "arguments": "{}"},
-                        },
+                        42,  # non-object entry: a gap at its positional index
                     ],
                 }
             ]
         }
     )
+    assert oai.tool_calls == (tool_call_segment("f", raw_args),)  # well-formed entry inspected
     locations = [gap.location for gap in oai.uninspected if gap.kind == GAP_TOOL_CALL]
-    assert locations == ["messages[0].tool_calls[0]", "messages[0].tool_calls[1]"]
+    assert locations == ["messages[0].tool_calls[1]"]
     for gap in oai.uninspected:
         assert raw_args not in gap.detail
+
+    # non-list tool_calls: a tool_call gap without per-entry indexing
+    oai = _oai({"messages": [{"role": "assistant", "content": None, "tool_calls": 42}]})
+    assert any(
+        gap.kind == GAP_TOOL_CALL and gap.location == "messages[0].tool_calls"
+        for gap in oai.uninspected
+    )
 
 
 def test_legacy_function_call_and_functions_are_gaps():
@@ -330,7 +494,7 @@ def test_malformed_containers_are_gaps_not_crashes():
 
     c = _oai({"messages": [{"role": "assistant", "content": None, "tool_calls": 42}]})
     assert any(
-        gap.kind == "other" and gap.location == "messages[0].tool_calls"
+        gap.kind == GAP_TOOL_CALL and gap.location == "messages[0].tool_calls"
         for gap in c.uninspected
     )
 
@@ -397,13 +561,13 @@ ANT_STREAM = (
 
 def test_accumulated_stream_deltas_form_assistant_text():
     """T-CONTENT-NORMALIZATION-006 (both formats), incl. split chunk boundaries."""
-    text, gaps = openai.extract_stream_text(OAI_STREAM)
-    assert text == "Hello"
-    assert gaps == ()
+    oai = openai.extract_stream_text(OAI_STREAM)
+    assert oai.assistant_text == ("Hello",)
+    assert oai.uninspected == ()
 
-    text, gaps = anthropic.extract_stream_text(ANT_STREAM)
-    assert text == "Hello"
-    assert gaps == ()
+    ant = anthropic.extract_stream_text(ANT_STREAM)
+    assert ant.assistant_text == ("Hello",)
+    assert ant.uninspected == ()
 
 
 def test_sse_extracts_across_chunk_boundaries_that_split_lines():
@@ -411,12 +575,12 @@ def test_sse_extracts_across_chunk_boundaries_that_split_lines():
     # parse must yield the same result.
     for offset in (1, 5, 20, len(OAI_STREAM) // 2):
         chunks = [OAI_STREAM[:offset], OAI_STREAM[offset:]]
-        text, _ = openai.extract_stream_text(b"".join(chunks))
-        assert text == "Hello", offset
+        oai = openai.extract_stream_text(b"".join(chunks))
+        assert oai.assistant_text == ("Hello",), offset
     for offset in (3, 17, 40):
         chunks = [ANT_STREAM[:offset], ANT_STREAM[offset : offset + 10], ANT_STREAM[offset + 10 :]]
-        text, _ = anthropic.extract_stream_text(b"".join(chunks))
-        assert text == "Hello", offset
+        ant = anthropic.extract_stream_text(b"".join(chunks))
+        assert ant.assistant_text == ("Hello",), offset
 
 
 def test_sse_non_text_deltas_are_gaps():
@@ -424,20 +588,20 @@ def test_sse_non_text_deltas_are_gaps():
         b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n'
         b'data: {"error":{"message":"boom"}}\n\n'
     )
-    text, gaps = openai.extract_stream_text(oai_stream)
-    assert text == ""
-    kinds = [gap.kind for gap in gaps]
+    oai = openai.extract_stream_text(oai_stream)
+    assert oai.assistant_text == ()
+    kinds = [gap.kind for gap in oai.uninspected]
     assert GAP_TOOL_CALL in kinds
-    assert any(gap.kind == "stream_error" for gap in gaps)
+    assert any(gap.kind == "stream_error" for gap in oai.uninspected)
 
     nonstring_content = (
         b'data: {"choices":[{"delta":{"content":[{"type":"text","text":"hi"}]}}]}\n\n'
     )
-    text, gaps = openai.extract_stream_text(nonstring_content)
-    assert text == ""
+    oai = openai.extract_stream_text(nonstring_content)
+    assert oai.assistant_text == ()
     assert any(
         gap.kind == GAP_UNKNOWN_PART and gap.location == "choices[0].delta.content"
-        for gap in gaps
+        for gap in oai.uninspected
     )
 
     ant_stream = (
@@ -446,10 +610,117 @@ def test_sse_non_text_deltas_are_gaps():
         b'{"type":"input_json_delta","partial_json":"{}"}}\n\n'
         b'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"x"}}\n\n'
     )
-    text, gaps = anthropic.extract_stream_text(ant_stream)
-    assert text == ""
-    assert any(gap.kind == GAP_UNKNOWN_PART for gap in gaps)
-    assert any(gap.kind == "stream_error" for gap in gaps)
+    ant = anthropic.extract_stream_text(ant_stream)
+    assert ant.assistant_text == ()
+    assert any(gap.kind == GAP_UNKNOWN_PART for gap in ant.uninspected)
+    assert any(gap.kind == "stream_error" for gap in ant.uninspected)
+
+
+def test_openai_stream_tool_calls_reconstructed():
+    """T-CONTENT-NORMALIZATION-019: one call split across chunks by index."""
+    stream = (
+        b'data: {"id":"1","choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        b'data: {"id":"1","choices":[{"delta":{"content":"running "}}]}\n\n'
+        b'data: {"id":"1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+        b'"type":"function","function":{"name":"shell","arguments":"{\\"com"}}]}}]}\n\n'
+        b'data: {"id":"1","choices":[{"delta":{"tool_calls":'
+        b'[{"index":0,"function":{"arguments":"mand\\": \\"ls\\"}"}}]}}]}\n\n'
+        b'data: {"id":"1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    c = openai.extract_stream_text(stream)
+    assert c.assistant_text == ("running ",)
+    assert c.tool_calls == (tool_call_segment("shell", {"command": "ls"}),)
+    assert c.uninspected == ()
+
+
+def test_anthropic_stream_tool_use_reconstructed():
+    """T-CONTENT-NORMALIZATION-020: tool_use block via start/delta/stop events."""
+    stream = (
+        b'event: message_start\ndata: {"type":"message_start"}\n\n'
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":0,"content_block":'
+        b'{"type":"tool_use","id":"t1","name":"shell","input":{}}}\n\n'
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,"delta":'
+        b'{"type":"input_json_delta","partial_json":"{\\"com"}}\n\n'
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,"delta":'
+        b'{"type":"input_json_delta","partial_json":"mand\\": \\"ls\\"}"}}\n\n'
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+    c = anthropic.extract_stream_text(stream)
+    assert c.assistant_text == ()
+    assert c.tool_calls == (tool_call_segment("shell", {"command": "ls"}),)
+    assert c.uninspected == ()
+
+
+def test_anthropic_stream_tool_use_complete_input_at_start():
+    """A tool_use block whose full input arrives at content_block_start (no
+    input_json_delta) still yields one inspectable segment."""
+    stream = (
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":0,"content_block":'
+        b'{"type":"tool_use","id":"t1","name":"shell","input":{"command": "ls"}}}\n\n'
+        b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    )
+    c = anthropic.extract_stream_text(stream)
+    assert c.tool_calls == (tool_call_segment("shell", {"command": "ls"}),)
+    assert c.uninspected == ()
+
+
+def test_stream_fragments_that_cannot_be_accumulated_are_gaps():
+    """4.4: missing index, non-object entries, and nothing reconstructable are
+    tool_call gaps, never silent drops."""
+    stream = (
+        # well-formed call on index 1, plus un-accumulatable fragments:
+        b'data: {"choices":[{"delta":{"tool_calls":'
+        b'[{"function":{"name":"bad","arguments":"{}"}}]}}]}\n\n'
+        b'data: {"choices":[{"delta":{"tool_calls":["non-object"]}}]}\n\n'
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n'
+        b'data: {"choices":[{"delta":{"tool_calls":'
+        b'[{"index":1,"function":{"name":"ok","arguments":"{\\"a\\":1}"}}]}}]}\n\n'
+    )
+    c = openai.extract_stream_text(stream)
+    assert c.tool_calls == (tool_call_segment("ok", {"a": 1}),)
+    tool_call_gaps = [gap for gap in c.uninspected if gap.kind == GAP_TOOL_CALL]
+    assert len(tool_call_gaps) == 3
+    # the index-1 call reconstructed; the bare index-0 slot did not
+    assert c.uninspected[0].location == "choices[0].delta.tool_calls"
+
+
+def test_stream_tool_call_gaps_never_contain_raw_content():
+    """4.4 + redaction guard: un-accumulatable fragment content stays out of
+    every gap detail and location."""
+    secret = "SECRET-STREAM-FRAGMENT-0123456789"
+    stream = (
+        b'data: {"choices":[{"delta":{"tool_calls":[{"function":{"name":"'
+        + secret.encode()
+        + b'","arguments":"'
+        + secret.encode()
+        + b'"}}]}}]}\n\n'
+        + b'data: {"choices":[{"delta":{"tool_calls":["'
+        + secret.encode()
+        + b'"]}}]}\n\n'
+        + b'data: {"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}\n\n'
+    )
+    c = openai.extract_stream_text(stream)
+    assert c.tool_calls == ()
+    for gap in c.uninspected:
+        assert secret not in gap.detail
+        assert secret not in gap.location
+
+    ant_stream = (
+        b"event: content_block_start\n"
+        + b'data: {"type":"content_block_start","index":0,"content_block":'
+        + b'{"type":"tool_use","id":"t1","name":"'
+        + secret.encode()
+        + b'","input":{}}}\n\n'
+    )
+    ant = anthropic.extract_stream_text(ant_stream)
+    assert ant.tool_calls == (tool_call_segment(secret, None),)  # name is inspected content
+    assert all(secret not in gap.detail for gap in ant.uninspected)
 
 
 def test_gap_details_never_contain_raw_values():
@@ -470,9 +741,9 @@ def test_gap_details_never_contain_raw_values():
             assert len(gap.detail) <= 200
 
     stream = f'event: {secret}\ndata: {{"type":"x"}}\n\n'.encode()
-    _, openai_stream_gaps = openai.extract_stream_text(stream)
-    _, ant_stream_gaps = anthropic.extract_stream_text(stream)
-    for gap in [*openai_stream_gaps, *ant_stream_gaps]:
+    openai_stream = openai.extract_stream_text(stream)
+    ant_stream = anthropic.extract_stream_text(stream)
+    for gap in [*openai_stream.uninspected, *ant_stream.uninspected]:
         assert secret not in gap.detail
 
 

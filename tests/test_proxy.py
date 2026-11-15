@@ -319,6 +319,39 @@ def test_fail_closed_blocks_image_without_upstream_contact(tmp_path):
     assert verdicts[0]["enforced"] is True
 
 
+def test_fail_closed_forwards_inspected_tool_content(tmp_path):
+    """T-CONTENT-NORMALIZATION-015: tool calls/results are inspected, not gapped."""
+    config = make_test_config(tmp_path, uninspected_policy="fail_closed")
+    ensure_rules_dir(config)
+    records: list[httpx.Request] = []
+    app = create_app(config, upstream_transport=httpx.MockTransport(make_upstream_handler(records)))
+    body = {
+        "model": "qwen3-32b",
+        "messages": [
+            {"role": "user", "content": "list the files"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": '{"command": "ls"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "file.txt"},
+        ],
+    }
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=body, headers=auth_headers())
+    assert response.status_code == 200  # forwarded: tool content is inspected
+    assert len(records) == 1
+    events = read_events(config.events.path)
+    gaps = events_of_type(events, "uninspected_content")
+    assert not gaps  # no tool_call/tool_result gaps, no other uninspected content
+
+
 def test_flag_policy_forwards_image_and_records_event(tmp_path):
     """T-CONTENT-NORMALIZATION-013: default flag policy forwards and records the gap."""
     config = make_test_config(tmp_path)  # uninspected_policy defaults to "flag"
@@ -331,6 +364,55 @@ def test_flag_policy_forwards_image_and_records_event(tmp_path):
     assert len(records) == 1
     gaps = events_of_type(read_events(config.events.path), "uninspected_content")
     assert [gap["kind"] for gap in gaps] == ["image"]
+
+
+def test_tool_results_match_in_verdict_event_with_bounded_excerpt(tmp_path):
+    """6.2: a tool_results match reaches the verdict event with its field name
+    and an excerpt bounded to ``excerpt_max_chars``."""
+    config = make_test_config(tmp_path)  # monitor: forwards, records the verdict
+    rules_dir = ensure_rules_dir(config)
+    write_rule_file(
+        rules_dir,
+        "tools.jsonl",
+        [
+            {
+                "id": "TR-RULE",
+                "name": "long run in tool output",
+                "version": "1",
+                "stage": "request",
+                "target": ["tool_results"],
+                "type": "regex",
+                "severity": "high",
+                "action": "block",
+                "enabled": True,
+                "pattern": "y{500}",
+            }
+        ],
+    )
+    records: list[httpx.Request] = []
+    app = create_app(config, upstream_transport=httpx.MockTransport(make_upstream_handler(records)))
+    tool_result = "prefix " + "y" * 500 + " tail"
+    body = {
+        "model": "qwen3-32b",
+        "messages": [
+            {"role": "user", "content": "summarize the output"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "shell"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": tool_result},
+        ],
+    }
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=body, headers=auth_headers())
+    assert response.status_code == 200
+    assert len(records) == 1
+    verdicts = events_of_type(read_events(config.events.path), "verdict")
+    assert len(verdicts) == 1
+    assert verdicts[0]["stage"] == "request"
+    (match,) = [m for m in verdicts[0]["matches"] if m["rule_id"] == "TR-RULE"]
+    assert match["field"] == "tool_results"
+    # the 500-char match is bounded to excerpt_max_chars (200 in the test config)
+    assert match["excerpt"] == "y" * 200
+    assert len(match["excerpt"]) == 200
 
 
 def test_duplicate_key_body_returns_400(tmp_path):

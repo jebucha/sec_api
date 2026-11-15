@@ -22,33 +22,114 @@ from .canonical import (
     GAP_UNKNOWN_PART,
     Canonical,
     Gap,
+    tool_call_segment,
 )
 
 
 def _gap_kind_for_block(block: Any) -> tuple[str, str]:
+    """The gap kind for a block the parser does not extract.
+
+    ``tool_use`` blocks normally become ``tool_calls`` segments; this is only
+    reached when the block is malformed or the context does not collect tool
+    calls (e.g. a response body).
+    """
     if not isinstance(block, dict):
         return GAP_UNKNOWN_PART, "non-object block"
     btype = block.get("type")
     if btype == "tool_use":
-        return GAP_TOOL_CALL, "tool_use block is not inspected in v1"
+        return GAP_TOOL_CALL, "tool_use block is not inspected"
     if btype == "tool_result":
-        return GAP_TOOL_RESULT, "tool_result block is not inspected in v1"
+        return GAP_TOOL_RESULT, "tool_result block is not inspected"
     if btype == "image":
-        return GAP_IMAGE, "image block is not inspected in v1"
+        return GAP_IMAGE, "image block is not inspected"
     return GAP_UNKNOWN_PART, "unrecognized content block type"
 
 
-def _text_of_block(block: Any) -> str | None:
+def _gap_kind_for_part(part: Any) -> tuple[str, str]:
+    if not isinstance(part, dict):
+        return GAP_UNKNOWN_PART, "non-object content part"
+    if part.get("type") == "image":
+        return GAP_IMAGE, "image part"
+    return GAP_UNKNOWN_PART, "unrecognized content part type"
+
+
+def _tool_result_segments(block: dict, location: str, out: list[str]) -> list[Gap]:
+    """D2: one ``tool_results`` segment per text unit of a tool_result block;
+    non-text parts (images, unknown) stay gaps."""
+    content = block.get("content")
+    if content is None:
+        return []
+    if isinstance(content, str):
+        if content:
+            out.append(content)
+        return []
+    if isinstance(content, list):
+        gaps: list[Gap] = []
+        for index, part in enumerate(content):
+            part_location = f"{location}.content[{index}]"
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    if text:
+                        out.append(text)
+                    continue
+            kind, detail = _gap_kind_for_part(part)
+            gaps.append(Gap(kind=kind, location=part_location, detail=detail))
+        return gaps
+    return [
+        Gap(
+            GAP_TOOL_RESULT,
+            location,
+            "non-string tool_result content; content was not inspected",
+        )
+    ]
+
+
+def _route_block(
+    block: Any,
+    location: str,
+    bucket: list[str],
+    tool_calls: list[str] | None,
+    tool_results: list[str] | None,
+) -> list[Gap]:
+    """Route one content block: text to ``bucket``, well-formed tool blocks to
+    their canonical fields, everything uninspected to a gap."""
     if isinstance(block, dict) and block.get("type") == "text":
         text = block.get("text")
-        return text if isinstance(text, str) else None
-    return None
+        if isinstance(text, str):
+            if text:
+                bucket.append(text)
+            return []
+        return [Gap(GAP_UNKNOWN_PART, location, "non-string text block")]
+    if isinstance(block, dict) and block.get("type") == "tool_use":
+        if tool_calls is None:
+            kind, detail = _gap_kind_for_block(block)
+            return [Gap(kind, location, detail)]
+        name = block.get("name")
+        if isinstance(name, str):
+            tool_calls.append(tool_call_segment(name, block.get("input")))
+            return []
+        return [
+            Gap(GAP_TOOL_CALL, location, "malformed tool_use block; content was not inspected")
+        ]
+    if isinstance(block, dict) and block.get("type") == "tool_result":
+        if tool_results is None:
+            kind, detail = _gap_kind_for_block(block)
+            return [Gap(kind, location, detail)]
+        return _tool_result_segments(block, location, tool_results)
+    kind, detail = _gap_kind_for_block(block)
+    return [Gap(kind=kind, location=location, detail=detail)]
 
 
 def _parse_blocks(
-    content: Any, location: str, bucket: list[str]
+    content: Any,
+    location: str,
+    bucket: list[str],
+    tool_calls: list[str] | None = None,
+    tool_results: list[str] | None = None,
 ) -> list[Gap]:
-    """Extract text from Anthropic content (string or blocks array)."""
+    """Extract text from Anthropic content (string or blocks array); tool
+    blocks route to ``tool_calls``/``tool_results`` when collectors are given."""
     gaps: list[Gap] = []
     if isinstance(content, str):
         if content:
@@ -59,13 +140,9 @@ def _parse_blocks(
             gaps.append(Gap(GAP_UNKNOWN_PART, f"{location}.content", "non-object content"))
         return gaps
     for index, block in enumerate(content):
-        text = _text_of_block(block)
-        if text is not None:
-            if text:
-                bucket.append(text)
-            continue
-        kind, detail = _gap_kind_for_block(block)
-        gaps.append(Gap(kind=kind, location=f"{location}.content[{index}]", detail=detail))
+        gaps.extend(
+            _route_block(block, f"{location}.content[{index}]", bucket, tool_calls, tool_results)
+        )
     return gaps
 
 
@@ -87,6 +164,8 @@ def parse_request(body: bytes) -> Canonical:
     system: list[str] = []
     user: list[str] = []
     assistant: list[str] = []
+    tool_calls: list[str] = []
+    tool_results: list[str] = []
     gaps: list[Gap] = []
 
     top_system = data.get("system")
@@ -119,7 +198,7 @@ def parse_request(body: bytes) -> Canonical:
             if content is None:
                 continue
             bucket = user if role == "user" else assistant
-            gaps.extend(_parse_blocks(content, location, bucket))
+            gaps.extend(_parse_blocks(content, location, bucket, tool_calls, tool_results))
 
     tools = data.get("tools")
     if isinstance(tools, list) and tools:
@@ -135,6 +214,8 @@ def parse_request(body: bytes) -> Canonical:
         system=tuple(system),
         user_text=tuple(user),
         assistant_text=tuple(assistant),
+        tool_calls=tuple(tool_calls),
+        tool_results=tuple(tool_results),
         uninspected=tuple(gaps),
     )
 
@@ -149,50 +230,121 @@ def parse_response(body: bytes) -> Canonical:
         raise FormatError("response body must be a JSON object")
 
     assistant: list[str] = []
+    tool_calls: list[str] = []
     gaps: list[Gap] = []
     content = data.get("content")
     if content is not None and not isinstance(content, list):
         gaps.append(Gap(GAP_OTHER, "content", "content is not a list of blocks; not inspected"))
     if isinstance(content, list):
         for index, block in enumerate(content):
-            text = _text_of_block(block)
-            if text is not None:
-                if text:
-                    assistant.append(text)
-                continue
-            kind, detail = _gap_kind_for_block(block)
-            gaps.append(Gap(kind=kind, location=f"content[{index}]", detail=detail))
+            # Response stage: tool_use blocks are extracted; tool_result
+            # blocks do not occur in assistant responses and stay a gap.
+            gaps.extend(_route_block(block, f"content[{index}]", assistant, tool_calls, None))
 
-    return Canonical(assistant_text=tuple(assistant), uninspected=tuple(gaps))
+    return Canonical(
+        assistant_text=tuple(assistant), tool_calls=tuple(tool_calls), uninspected=tuple(gaps)
+    )
 
 
-def extract_stream_text(raw: bytes) -> tuple[str, list[Gap]]:
-    """Extract the concatenated text deltas from an Anthropic SSE stream.
+def extract_stream_text(raw: bytes) -> Canonical:
+    """Build the canonical structure from an accumulated Anthropic SSE stream.
 
-    Text deltas come from ``content_block_delta.delta.text`` (text_delta).
-    Protocol-only events (ping, message_stop) are ignored; events that carry
-    content the parser does not inspect are recorded as uninspected.
+    Assistant text comes from ``content_block_delta.delta.text`` (text_delta).
+    ``tool_use`` blocks are reconstructed across ``content_block_start`` /
+    ``input_json_delta`` / ``content_block_stop`` events (design D4): one D1
+    segment per block. Protocol-only events (ping, message_stop) are ignored;
+    events that carry content the parser does not inspect are recorded as
+    uninspected.
     """
     text_parts: list[str] = []
     gaps: list[Gap] = []
+    tool_call_segments: list[str] = []
+    # Open tool_use slots keyed by block index:
+    # {"name": str, "json": str, "input": object | None}
+    tool_slots: dict[int, dict] = {}
+
+    def close_slot(index: int) -> None:
+        slot = tool_slots.pop(index, None)
+        if slot is not None:
+            # Accumulated fragments win; a provider that sends the complete
+            # input at content_block_start (no input_json_delta) still yields
+            # an inspectable segment instead of "input": null.
+            arguments = slot["json"] or slot["input"]
+            tool_call_segments.append(tool_call_segment(slot["name"], arguments))
+
     for event, data in iter_sse_json(raw):
         if data is None:
             continue
         if not isinstance(data, dict):
             gaps.append(Gap(GAP_OTHER, "stream", "non-object stream event"))
             continue
+        if event == "content_block_start":
+            block = data.get("content_block")
+            if not isinstance(block, dict):
+                gaps.append(Gap(GAP_OTHER, "content_block_start", "non-object content_block"))
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                continue  # text arrives via text_delta events
+            if btype == "tool_use":
+                index = data.get("index")
+                name = block.get("name")
+                if (
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or index < 0
+                    or not isinstance(name, str)
+                ):
+                    gaps.append(
+                        Gap(
+                            GAP_TOOL_CALL,
+                            "content_block_start",
+                            "malformed tool_use block start; content was not inspected",
+                        )
+                    )
+                else:
+                    initial = block.get("input")
+                    tool_slots[index] = {
+                        "name": name,
+                        "json": "",
+                        "input": initial if initial else None,
+                    }
+                continue
+            kind, detail = _gap_kind_for_block(block)
+            gaps.append(Gap(kind, "content_block_start", detail))
+            continue
         if event == "content_block_delta":
             delta = data.get("delta")
             if not isinstance(delta, dict):
                 gaps.append(Gap(GAP_OTHER, "content_block_delta", "non-object delta"))
                 continue
-            if delta.get("type") == "text_delta":
+            dtype = delta.get("type")
+            if dtype == "text_delta":
                 text = delta.get("text")
                 if isinstance(text, str):
                     text_parts.append(text)
                 else:
                     gaps.append(
                         Gap(GAP_OTHER, "content_block_delta", "non-string text delta")
+                    )
+                continue
+            if dtype == "input_json_delta":
+                slot = tool_slots.get(data.get("index"))
+                if slot is None:
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            "content_block_delta",
+                            "input_json_delta without an open tool_use block",
+                        )
+                    )
+                    continue
+                partial = delta.get("partial_json")
+                if isinstance(partial, str):
+                    slot["json"] += partial
+                else:
+                    gaps.append(
+                        Gap(GAP_OTHER, "content_block_delta", "non-string partial_json fragment")
                     )
                 continue
             gaps.append(
@@ -203,25 +355,26 @@ def extract_stream_text(raw: bytes) -> tuple[str, list[Gap]]:
                 )
             )
             continue
-        elif event == "content_block_start":
-            block = data.get("content_block")
-            if not isinstance(block, dict):
-                gaps.append(
-                    Gap(GAP_OTHER, "content_block_start", "non-object content_block")
-                )
-            elif block.get("type") != "text":
-                kind, detail = _gap_kind_for_block(block)
-                gaps.append(Gap(kind, "content_block_start", detail))
+        if event == "content_block_stop":
+            close_slot(data.get("index"))
             continue
-        elif event in ("ping", "message_stop", "message_delta", "message_start"):
+        if event in ("ping", "message_stop", "message_delta", "message_start"):
             # Protocol events without inspectable content.
             continue
-        elif event == "error":
+        if event == "error":
             gaps.append(Gap(GAP_STREAM_ERROR, "stream", "error event in stream"))
             continue
-        else:
-            gaps.append(Gap(GAP_STREAM_ERROR, "stream", "unrecognized SSE event"))
-    return "".join(text_parts), tuple(gaps)
+        gaps.append(Gap(GAP_STREAM_ERROR, "stream", "unrecognized SSE event"))
+    # A stream that ends without content_block_stop still yields what was
+    # accumulated; the proxy adds the stream_error gap for the interruption.
+    for index in sorted(tool_slots):
+        close_slot(index)
+    full_text = "".join(text_parts)
+    return Canonical(
+        assistant_text=(full_text,) if full_text else (),
+        tool_calls=tuple(tool_call_segments),
+        uninspected=tuple(gaps),
+    )
 
 
 # --- provider-shaped error bodies -------------------------------------------

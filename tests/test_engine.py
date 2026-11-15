@@ -155,6 +155,23 @@ def test_disabled_rule_not_evaluated(tmp_path):
     assert verdict.action == "flag"  # the disabled block rule did not fire
 
 
+def test_large_tool_result_match_found():
+    """T-CONTENT-NORMALIZATION-023: a 1 MB segment is inspected in full."""
+    pattern = "needle-near-the-end"
+    segment = "x" * (1024 * 1024 - len(pattern)) + pattern
+    ruleset = make_ruleset(make_rule(rule_id="TR-1", matches=pattern, target=("tool_results",)))
+    verdict = evaluate(
+        ruleset,
+        _canon(tool_results=(segment,)),
+        stage="request",
+        mode="enforce",
+    )
+    (match,) = verdict.matches
+    assert match.field == "tool_results"
+    assert match.segment_index == 0
+    assert match.excerpt == pattern
+
+
 def test_long_match_excerpt_truncated():
     """T-DETECTION-ENGINE-008: a 5,000-char match is bounded to the max."""
     long_run = "x" * 5000

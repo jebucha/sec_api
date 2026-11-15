@@ -65,6 +65,71 @@ def sse_chunks(parts: list[str]) -> list[bytes]:
     ]
 
 
+def sse_tool_chunks(name: str, arguments: str) -> list[bytes]:
+    """OpenAI SSE chunks for one tool call split across two deltas."""
+    mid = len(arguments) // 2
+    return [
+        (
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "c1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": arguments[:mid],
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+            + "\n\n"
+        ).encode(),
+        (
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {"index": 0, "function": {"arguments": arguments[mid:]}}
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+            + "\n\n"
+        ).encode(),
+        b"data: [DONE]\n\n",
+    ]
+
+
+def _tool_call_rule() -> dict:
+    return {
+        "id": "RESP-TOOL",
+        "name": "tool call inspection",
+        "version": "1",
+        "stage": "response",
+        "target": ["tool_calls"],
+        "type": "keyword",
+        "severity": "low",
+        "action": "flag",
+        "enabled": True,
+        "keywords": ['"name": "shell"'],
+    }
+
+
 def _stream_app(tmp_path, chunks, *, config=None, delay=0.0, status=200, stream=None):
     config = config or make_test_config(tmp_path)
     ensure_rules_dir(config)
@@ -173,6 +238,54 @@ def test_enforce_clean_stream_replayed_byte_identical(tmp_path):
             for chunk in response.iter_bytes():
                 received.append(chunk)
     assert b"".join(received) == b"".join(chunks)
+
+
+def test_monitor_stream_tool_calls_are_inspected(tmp_path):
+    """VD-5: a streamed tool call reaches the response-stage rule evaluation."""
+    config = make_test_config(tmp_path, mode="monitor")
+    rules_dir = ensure_rules_dir(config)
+    write_rule_file(rules_dir, "response.jsonl", [_tool_call_rule()])
+    chunks = sse_tool_chunks("shell", '{"command": "ls"}')
+    app, config = _stream_app(tmp_path, chunks, config=config)
+    with TestClient(app) as client:
+        received = []
+        with client.stream(
+            "POST", "/v1/chat/completions", content=_stream_body(),
+            headers={**auth_headers(), "content-type": "application/json"},
+        ) as response:
+            assert response.status_code == 200
+            for chunk in response.iter_bytes():
+                received.append(chunk)
+    assert b"".join(received) == b"".join(chunks)
+    verdicts = events_of_type(read_events(config.events.path), "verdict")
+    assert len(verdicts) == 1
+    assert verdicts[0]["stage"] == "response"
+    assert verdicts[0]["action"] == "flag"
+    assert verdicts[0]["matches"][0]["field"] == "tool_calls"
+
+
+def test_enforce_stream_tool_calls_are_inspected_and_replayed(tmp_path):
+    """VD-5: the enforce buffer+replay path also inspects streamed tool calls."""
+    config = make_test_config(tmp_path, mode="enforce")
+    rules_dir = ensure_rules_dir(config)
+    write_rule_file(rules_dir, "response.jsonl", [_tool_call_rule()])
+    chunks = sse_tool_chunks("shell", '{"command": "ls"}')
+    app, config = _stream_app(tmp_path, chunks, config=config)
+    with TestClient(app) as client:
+        received = []
+        with client.stream(
+            "POST", "/v1/chat/completions", content=_stream_body(),
+            headers={**auth_headers(), "content-type": "application/json"},
+        ) as response:
+            assert response.status_code == 200
+            for chunk in response.iter_bytes():
+                received.append(chunk)
+    assert b"".join(received) == b"".join(chunks)
+    verdicts = events_of_type(read_events(config.events.path), "verdict")
+    assert len(verdicts) == 1
+    assert verdicts[0]["stage"] == "response"
+    assert verdicts[0]["action"] == "flag"
+    assert verdicts[0]["matches"][0]["field"] == "tool_calls"
 
 
 def test_enforce_blocked_stream_returns_block_without_content(tmp_path):

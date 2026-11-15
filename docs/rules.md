@@ -33,6 +33,27 @@ the file, line, rule id (if parseable), and reason.
 
 Unknown fields are rejected.
 
+## Tool content segments
+
+The `tool_calls` and `tool_results` targets are live in both formats.
+
+- `tool_calls`: one segment per tool call — a single JSON object with sorted
+  keys, `{"input": <arguments>, "name": "<tool name>"}`, where `input` is the
+  parsed arguments object (OpenAI's stringified `function.arguments` or
+  Anthropic's `tool_use.input`). An `arguments` string that does not parse is
+  the raw string. A single pattern sees the call's name and arguments
+  together in one deterministic encoding, identical across formats. Tool calls
+  are inspected at both stages (request history and response), including
+  accumulated streams.
+- `tool_results`: one segment per tool result text (the string content of an
+  OpenAI `role: "tool"` message, or the text of an Anthropic `tool_result`
+  block / text part). Segments are inspected in full. Tool results are
+  request-stage content only: a response carries no tool results, so a
+  response-stage rule targeting `tool_results` has nothing to inspect.
+
+Tool definitions (`tools[]`), images, and malformed tool content remain
+uninspected (they are `uninspected_content` events, not rule targets).
+
 ## Per-type payloads
 
 - `regex`: requires `pattern` (string). Compiled with **RE2** (linear time,
@@ -124,6 +145,14 @@ built, so unmasked values never reach the event stream.
 
 ```json
 {"id": "JB-001", "name": "Jailbreak marker", "version": "1", "stage": "request", "target": ["user_text"], "type": "regex", "severity": "high", "action": "flag", "enabled": true, "description": "Common jailbreak framing (example only).", "owasp": ["LLM01:2025"], "pattern": "(?i)\\bDAN\\b.{0,40}\\bmode\\b", "tests": {"match": ["enter DAN mode now"], "no_match": ["data mode for analysis"]}}
+```
+
+```json
+{"id": "TC-001", "name": "Shell tool call", "version": "1", "stage": "request", "target": ["tool_calls"], "type": "keyword", "severity": "medium", "action": "flag", "enabled": true, "description": "Tool calls named shell. tool_calls segments are the JSON object {\"input\": <arguments>, \"name\": <tool name>} with sorted keys, so one pattern sees name and arguments together.", "keywords": ["\"name\": \"shell\""], "tests": {"match": ["{\"input\": {\"command\": \"ls\"}, \"name\": \"shell\"}"], "no_match": ["{\"input\": {}, \"name\": \"search\"}"]}}
+```
+
+```json
+{"id": "TR-001", "name": "Exfiltration marker in tool output", "version": "1", "stage": "request", "target": ["tool_results"], "type": "keyword", "severity": "high", "action": "block", "enabled": true, "description": "A marker string planted in tool output (file contents, command output, web fetches).", "keywords": ["EXFIL-TOOL-RESULT"], "tests": {"match": ["fetched page contains EXFIL-TOOL-RESULT"], "no_match": ["clean tool output"]}}
 ```
 
 ```json

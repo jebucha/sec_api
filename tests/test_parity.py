@@ -59,6 +59,70 @@ def test_identical_responses_yield_identical_canonical_fields():
     assert oai_canon.assistant_text == ant_canon.assistant_text == ("The answer is 4.",)
 
 
+def test_identical_tool_content_yields_identical_canonical_fields():
+    """T-CONTENT-NORMALIZATION-024: one tool call + one tool result, both formats."""
+    oai_body = json.dumps(
+        {
+            "model": "qwen3-32b",
+            "messages": [
+                {"role": "user", "content": "list the files"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "shell",
+                                "arguments": '{"command": "ls -la", "cwd": "/tmp"}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "total 0\nfile.txt"},
+            ],
+        }
+    ).encode()
+    ant_body = json.dumps(
+        {
+            "model": "llama-3.1-8b",
+            "messages": [
+                {"role": "user", "content": "list the files"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "shell",
+                            "input": {"command": "ls -la", "cwd": "/tmp"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "total 0\nfile.txt"}
+                    ],
+                },
+            ],
+        }
+    ).encode()
+
+    oai_canon = openai.parse_request(oai_body)
+    ant_canon = anthropic.parse_request(ant_body)
+
+    assert oai_canon.tool_calls == ant_canon.tool_calls
+    assert oai_canon.tool_results == ant_canon.tool_results
+    # sanity: the shared D1 segment and the shared result text
+    expected_segment = json.dumps(
+        {"input": {"command": "ls -la", "cwd": "/tmp"}, "name": "shell"}, sort_keys=True
+    )
+    assert oai_canon.tool_calls == (expected_segment,)
+    assert oai_canon.tool_results == ("total 0\nfile.txt",)
+
+
 def test_parity_across_multipart_and_block_text():
     oai_body = json.dumps(
         {

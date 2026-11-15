@@ -318,8 +318,7 @@ async def _enforce_stream(
         )
         return _block_response(gw, ctx, fmt, event_id=event_id, rule_ids=[], started=started)
 
-    text, gaps = fmt_mod.extract_stream_text(bytes(buffer))
-    canonical = Canonical(assistant_text=(text,) if text else (), uninspected=tuple(gaps))
+    canonical = fmt_mod.extract_stream_text(bytes(buffer))
     blocked = _response_stage(gw, ruleset, ctx, fmt, model, upstream, canonical)
     if blocked:
         return _block_response(
@@ -398,8 +397,7 @@ async def _monitor_tee(
                     stage="response",
                 )
             )
-        text, gaps = fmt_mod.extract_stream_text(bytes(buffer))
-        canonical = Canonical(assistant_text=(text,) if text else (), uninspected=tuple(gaps))
+        canonical = fmt_mod.extract_stream_text(bytes(buffer))
         _response_stage(gw, ruleset, ctx, fmt, model, upstream, canonical)
         writer.emit(
             request_completed_event(

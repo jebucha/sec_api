@@ -16,10 +16,58 @@ from .canonical import (
     GAP_UNKNOWN_PART,
     Canonical,
     Gap,
+    tool_call_segment,
 )
 
 TEXT_LIKE_PARTS = ("text",)
 IMAGE_PARTS = ("image_url", "image")
+
+
+def _openai_call_name_arguments(call: Any) -> tuple[str, object] | None:
+    """``(name, arguments)`` of an OpenAI ``tool_calls`` entry, or None if
+    the entry is malformed (non-object, or no ``function.name`` string)."""
+    if not isinstance(call, dict):
+        return None
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    if not isinstance(name, str):
+        return None
+    return name, function.get("arguments")
+
+
+def _collect_openai_tool_calls(
+    tool_calls_field: Any, location: str, tool_calls: list[str], gaps: list[Gap]
+) -> None:
+    """Append one segment per well-formed ``tool_calls`` entry; gap the rest.
+
+    Shared by the request and response parsers so both stages classify
+    malformed tool content identically (non-list ``tool_calls`` is a
+    ``tool_call`` gap).
+    """
+    if isinstance(tool_calls_field, list):
+        for call_index, call in enumerate(tool_calls_field):
+            pair = _openai_call_name_arguments(call)
+            if pair is None:
+                gaps.append(
+                    Gap(
+                        GAP_TOOL_CALL,
+                        f"{location}.tool_calls[{call_index}]",
+                        "malformed tool call entry; content was not inspected",
+                    )
+                )
+            else:
+                name, arguments = pair
+                tool_calls.append(tool_call_segment(name, arguments))
+    elif tool_calls_field:
+        gaps.append(
+            Gap(
+                GAP_TOOL_CALL,
+                f"{location}.tool_calls",
+                "tool_calls is not a list; content was not inspected",
+            )
+        )
 
 
 def _text_of_part(part: Any) -> str | None:
@@ -61,6 +109,8 @@ def parse_request(body: bytes) -> Canonical:
     system: list[str] = []
     user: list[str] = []
     assistant: list[str] = []
+    tool_calls: list[str] = []
+    tool_results: list[str] = []
     gaps: list[Gap] = []
 
     messages = data.get("messages")
@@ -73,9 +123,20 @@ def parse_request(body: bytes) -> Canonical:
                 continue
             role = message.get("role")
             if role == "tool":
-                gaps.append(
-                    Gap(GAP_TOOL_RESULT, f"messages[{index}]", "tool result is not inspected in v1")
-                )
+                # D2: string content is one tool_results segment verbatim;
+                # non-string content stays a gap.
+                content = message.get("content")
+                if isinstance(content, str):
+                    if content:
+                        tool_results.append(content)
+                elif content is not None:
+                    gaps.append(
+                        Gap(
+                            GAP_TOOL_RESULT,
+                            f"messages[{index}]",
+                            "non-string tool result content; content was not inspected",
+                        )
+                    )
                 continue
             if role not in ("system", "developer", "user", "assistant"):
                 gaps.append(
@@ -86,30 +147,14 @@ def parse_request(body: bytes) -> Canonical:
             content = message.get("content")
             if content is not None:
                 gaps.extend(_route_content(content, role, location, system, user, assistant))
-            tool_calls = message.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for call_index, _call in enumerate(tool_calls):
-                    gaps.append(
-                        Gap(
-                            GAP_TOOL_CALL,
-                            f"{location}.tool_calls[{call_index}]",
-                            "assistant tool_calls are not inspected in v1",
-                        )
-                    )
-            elif tool_calls:
-                gaps.append(
-                    Gap(
-                        GAP_OTHER,
-                        f"{location}.tool_calls",
-                        "tool_calls is not a list; content was not inspected",
-                    )
-                )
+            tool_calls_field = message.get("tool_calls")
+            _collect_openai_tool_calls(tool_calls_field, location, tool_calls, gaps)
             if message.get("function_call"):
                 gaps.append(
                     Gap(
                         GAP_TOOL_CALL,
                         f"{location}.function_call",
-                        "legacy function_call is not inspected in v1",
+                        "legacy function_call is not inspected",
                     )
                 )
     tools = data.get("tools")
@@ -137,6 +182,8 @@ def parse_request(body: bytes) -> Canonical:
         system=tuple(system),
         user_text=tuple(user),
         assistant_text=tuple(assistant),
+        tool_calls=tuple(tool_calls),
+        tool_results=tuple(tool_results),
         uninspected=tuple(gaps),
     )
 
@@ -181,6 +228,7 @@ def parse_response(body: bytes) -> Canonical:
         raise FormatError("response body must be a JSON object")
 
     assistant: list[str] = []
+    tool_calls: list[str] = []
     gaps: list[Gap] = []
     choices = data.get("choices")
     if choices is not None and not isinstance(choices, list):
@@ -198,7 +246,7 @@ def parse_response(body: bytes) -> Canonical:
                         Gap(
                             GAP_TOOL_CALL,
                             f"choices[{index}].function_call",
-                            "legacy function_call is not inspected in v1",
+                            "legacy function_call is not inspected",
                         )
                     )
                 continue
@@ -225,31 +273,104 @@ def parse_response(body: bytes) -> Canonical:
                 gaps.append(
                     Gap(GAP_UNKNOWN_PART, f"{location}.content", "non-text content")
                 )
-            if message.get("tool_calls"):
-                gaps.append(
-                    Gap(
-                        GAP_TOOL_CALL,
-                        f"{location}.tool_calls",
-                        "assistant tool_calls are not inspected in v1",
-                    )
-                )
+            tool_calls_field = message.get("tool_calls")
+            _collect_openai_tool_calls(tool_calls_field, location, tool_calls, gaps)
             if message.get("function_call"):
                 gaps.append(
-                    Gap(GAP_TOOL_CALL, location, "legacy function_call is not inspected in v1")
+                    Gap(GAP_TOOL_CALL, location, "legacy function_call is not inspected")
                 )
 
-    return Canonical(assistant_text=tuple(assistant), uninspected=tuple(gaps))
+    return Canonical(
+        assistant_text=tuple(assistant), tool_calls=tuple(tool_calls), uninspected=tuple(gaps)
+    )
 
 
-def extract_stream_text(raw: bytes) -> tuple[str, list[Gap]]:
-    """Extract the concatenated text deltas from an OpenAI SSE stream.
+def _accumulate_openai_fragment(
+    fragment: Any,
+    location: str,
+    call_names: dict[int, str],
+    call_args: dict[int, list[str]],
+    open_indices: set[int],
+    gaps: list[Gap],
+) -> None:
+    """Accumulate one ``delta.tool_calls`` fragment by index (design D4).
 
-    Text deltas come from ``choices[].delta.content``. Protocol-only chunks
-    (role, finish_reason) are ignored; chunks carrying non-text delta content
-    (e.g. tool_calls) or stream errors are recorded as uninspected.
+    Fragments that cannot be accumulated (non-object, missing index,
+    non-string name or arguments) are recorded as gaps with a detail that
+    never contains raw fragment content.
+    """
+    if not isinstance(fragment, dict):
+        gaps.append(Gap(GAP_TOOL_CALL, location, "non-object tool call fragment"))
+        return
+    index = fragment.get("index")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        gaps.append(Gap(GAP_TOOL_CALL, location, "tool call fragment without a usable index"))
+        return
+    open_indices.add(index)
+    function = fragment.get("function")
+    if function is None:
+        return  # index-only fragment: the slot opens and later fragments fill it
+    if not isinstance(function, dict):
+        gaps.append(Gap(GAP_TOOL_CALL, location, "non-object function fragment"))
+        return
+    name = function.get("name")
+    if name is not None:
+        if isinstance(name, str):
+            call_names.setdefault(index, name)
+        else:
+            gaps.append(Gap(GAP_TOOL_CALL, location, "non-string tool call name fragment"))
+    arguments = function.get("arguments")
+    if arguments is not None:
+        if isinstance(arguments, str):
+            call_args.setdefault(index, []).append(arguments)
+        else:
+            gaps.append(Gap(GAP_TOOL_CALL, location, "non-string arguments fragment"))
+
+
+def _finalize_openai_calls(
+    call_names: dict[int, str],
+    call_args: dict[int, list[str]],
+    open_indices: set[int],
+    gaps: list[Gap],
+) -> list[str]:
+    """One D1 segment per reconstructed call, at stream end (design D4).
+
+    An opened slot with nothing reconstructable (no name, no arguments) is
+    a gap, never a silent drop.
+    """
+    segments: list[str] = []
+    for index in sorted(open_indices):
+        location = f"stream.tool_calls[{index}]"
+        name = call_names.get(index)
+        fragments = call_args.get(index, ())
+        if name is None:
+            detail = (
+                "tool call fragments without a name; not reconstructable"
+                if fragments
+                else "tool call fragment without name or arguments; not reconstructable"
+            )
+            gaps.append(Gap(GAP_TOOL_CALL, location, detail))
+            continue
+        raw_arguments = "".join(fragments) if fragments else None
+        segments.append(tool_call_segment(name, raw_arguments))
+    return segments
+
+
+def extract_stream_text(raw: bytes) -> Canonical:
+    """Build the canonical structure from an accumulated OpenAI SSE stream.
+
+    Assistant text comes from ``choices[].delta.content``. Tool calls are
+    reconstructed from ``choices[].delta.tool_calls`` fragments accumulated
+    by index (design D4): one D1 segment per complete call at stream end.
+    Protocol-only chunks (role, finish_reason) are ignored; chunks carrying
+    uninspectable content (error objects, non-accumulatable tool-call
+    fragments, other non-text delta fields) are recorded as uninspected.
     """
     text_parts: list[str] = []
     gaps: list[Gap] = []
+    call_names: dict[int, str] = {}
+    call_args: dict[int, list[str]] = {}
+    open_indices: set[int] = set()
     for _event, data in iter_sse_json(raw):
         if data is None:
             continue  # "[DONE]" and unparseable data
@@ -287,20 +408,38 @@ def extract_stream_text(raw: bytes) -> tuple[str, list[Gap]]:
                         "non-string delta content",
                     )
                 )
+            delta_tool_calls = delta.get("tool_calls")
+            if delta_tool_calls is not None:
+                if isinstance(delta_tool_calls, list):
+                    fragment_location = f"choices[{index}].delta.tool_calls"
+                    for fragment in delta_tool_calls:
+                        _accumulate_openai_fragment(
+                            fragment, fragment_location, call_names, call_args, open_indices, gaps
+                        )
+                else:
+                    gaps.append(
+                        Gap(
+                            GAP_TOOL_CALL,
+                            f"choices[{index}].delta.tool_calls",
+                            "tool_calls delta is not a list; content was not inspected",
+                        )
+                    )
             non_text = {
                 key for key in delta
-                if key not in ("role", "content") and delta[key] is not None
+                if key not in ("role", "content", "tool_calls") and delta[key] is not None
             }
             if non_text:
-                kind = (
-                    GAP_TOOL_CALL
-                    if "tool_calls" in non_text or "function_call" in non_text
-                    else GAP_UNKNOWN_PART
-                )
+                kind = GAP_TOOL_CALL if "function_call" in non_text else GAP_UNKNOWN_PART
                 gaps.append(
                     Gap(kind, f"choices[{index}].delta", "non-text delta fields present")
                 )
-    return "".join(text_parts), tuple(gaps)
+    tool_calls = _finalize_openai_calls(call_names, call_args, open_indices, gaps)
+    full_text = "".join(text_parts)
+    return Canonical(
+        assistant_text=(full_text,) if full_text else (),
+        tool_calls=tuple(tool_calls),
+        uninspected=tuple(gaps),
+    )
 
 
 # --- provider-shaped error bodies -------------------------------------------
