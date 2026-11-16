@@ -20,6 +20,7 @@ from llmgw.formats.canonical import (
     GAP_UNKNOWN_PART,
     Canonical,
     tool_call_segment,
+    tool_definition_segment,
 )
 
 
@@ -174,9 +175,82 @@ def test_openai_stream_reasoning_deltas_accumulated():
     assert c.uninspected == ()
 
 
+def test_openai_response_reasoning_alias_extracted():
+    """T-CONTENT-NORMALIZATION-034: message.reasoning (no reasoning_content) is
+    a reasoning segment, not an uninspected gap."""
+    body = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "The answer is 4.",
+                        "reasoning": "I should add 2 and 2.",
+                    }
+                }
+            ]
+        }
+    ).encode()
+    c = openai.parse_response(body)
+    assert c.assistant_text == ("The answer is 4.",)
+    assert c.reasoning_text == ("I should add 2 and 2.",)
+    assert c.uninspected == ()
+
+
+def test_openai_stream_reasoning_alias_accumulated():
+    """T-CONTENT-NORMALIZATION-035: delta.reasoning fragments join into one
+    segment and are not recorded as non-text delta gaps."""
+    stream = (
+        b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"reasoning":"Let me "}}]}\n\n'
+        b'data: {"choices":[{"delta":{"reasoning":"think about it."}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"The answer is 4."}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    c = openai.extract_stream_text(stream)
+    assert c.assistant_text == ("The answer is 4.",)
+    assert c.reasoning_text == ("Let me think about it.",)
+    assert c.uninspected == ()
+
+
+def test_mirrored_reasoning_fields_not_duplicated():
+    """T-CONTENT-NORMALIZATION-036: both fields carrying the same text yield
+    exactly one segment (the reasoning_content value) and no uninspected event."""
+    body = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "The answer is 4.",
+                        "reasoning_content": "I should add 2 and 2.",
+                        "reasoning": "I should add 2 and 2.",
+                    }
+                }
+            ]
+        }
+    ).encode()
+    c = openai.parse_response(body)
+    assert c.reasoning_text == ("I should add 2 and 2.",)
+    assert c.uninspected == ()
+
+    stream = (
+        b'data: {"choices":[{"delta":'
+        b'{"reasoning_content":"Let me ","reasoning":"Let me "}}]}\n\n'
+        b'data: {"choices":[{"delta":'
+        b'{"reasoning_content":"think about it.","reasoning":"think about it."}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"The answer is 4."}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    c = openai.extract_stream_text(stream)
+    assert c.reasoning_text == ("Let me think about it.",)
+    assert c.uninspected == ()
+
+
 def test_malformed_reasoning_content_recorded_as_gap():
-    """T-CONTENT-NORMALIZATION-033: non-string reasoning text is an
-    unknown_part gap at the message/block location; the rest parses normally."""
+    """T-CONTENT-NORMALIZATION-033: non-string reasoning text (reasoning_content
+    or the reasoning alias, streamed or non-streamed) is an unknown_part gap at
+    the message/block/delta location; the rest parses normally."""
     oai = _oai(
         {
             "messages": [
@@ -188,6 +262,37 @@ def test_malformed_reasoning_content_recorded_as_gap():
     assert oai.reasoning_text == ()
     assert [(gap.kind, gap.location) for gap in oai.uninspected] == [
         (GAP_UNKNOWN_PART, "messages[0]")
+    ]
+
+    # non-streaming response: a non-string reasoning alias is a gap
+    oai_resp = openai.parse_response(
+        json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning": 42,
+                        }
+                    }
+                ]
+            }
+        ).encode()
+    )
+    assert oai_resp.assistant_text == ("answer",)
+    assert oai_resp.reasoning_text == ()
+    assert [(gap.kind, gap.location) for gap in oai_resp.uninspected] == [
+        (GAP_UNKNOWN_PART, "choices[0].message")
+    ]
+
+    # streamed: a non-string reasoning delta is a gap
+    oai_stream = openai.extract_stream_text(
+        b'data: {"choices":[{"delta":{"reasoning":42}}]}\n\n'
+    )
+    assert oai_stream.reasoning_text == ()
+    assert [(gap.kind, gap.location) for gap in oai_stream.uninspected] == [
+        (GAP_UNKNOWN_PART, "choices[0].delta.reasoning")
     ]
 
     ant = anthropic.parse_response(
@@ -495,16 +600,165 @@ def test_response_tool_calls_extracted():
     assert not ant.uninspected
 
 
-def test_tool_definitions_emit_uninspected_content_event():
-    """T-CONTENT-NORMALIZATION-010: non-empty ``tools`` array is a gap."""
-    oai = _oai({"messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function"}]})
-    assert any(gap.kind == GAP_TOOL_DEFINITIONS for gap in oai.uninspected)
+def test_tool_definitions_extracted_without_uninspected_event():
+    """T-CONTENT-NORMALIZATION-010: a non-empty ``tools`` array is extracted into
+    ``tool_definitions``, not recorded as uninspected."""
+    oai = _oai(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "description": "Run a command",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+    )
+    assert oai.tool_definitions == (
+        tool_definition_segment("shell", "Run a command", {"type": "object"}),
+    )
+    assert not any(gap.kind == GAP_TOOL_DEFINITIONS for gap in oai.uninspected)
 
-    ant = _ant({"messages": [{"role": "user", "content": "hi"}], "tools": [{"name": "t"}]})
-    assert any(gap.kind == GAP_TOOL_DEFINITIONS for gap in ant.uninspected)
+    ant = _ant(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "name": "t",
+                    "description": "A tool",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+        }
+    )
+    assert ant.tool_definitions == (
+        tool_definition_segment("t", "A tool", {"type": "object"}),
+    )
+    assert not any(gap.kind == GAP_TOOL_DEFINITIONS for gap in ant.uninspected)
 
     # Empty tools array is not a gap
     assert not _oai({"messages": [{"role": "user", "content": "hi"}], "tools": []}).uninspected
+
+
+def test_openai_tool_definitions_extracted():
+    """T-CONTENT-NORMALIZATION-037: one segment per ``function``-type entry,
+    carrying name, description, and parameter schema in a single JSON value."""
+    c = _oai(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "description": "Run a command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                        },
+                    },
+                },
+                {"type": "function", "function": {"name": "read"}},
+            ],
+        }
+    )
+    assert c.tool_definitions == (
+        tool_definition_segment(
+            "shell",
+            "Run a command",
+            {"type": "object", "properties": {"command": {"type": "string"}}},
+        ),
+        tool_definition_segment("read", None, None),
+    )
+    assert not c.uninspected
+
+
+def test_anthropic_tool_definitions_extracted():
+    """T-CONTENT-NORMALIZATION-038: one segment per entry, carrying name,
+    description, and input_schema in a single JSON value."""
+    c = _ant(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "name": "shell",
+                    "description": "Run a command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+                {"name": "read"},
+            ],
+        }
+    )
+    assert c.tool_definitions == (
+        tool_definition_segment(
+            "shell",
+            "Run a command",
+            {"type": "object", "properties": {"command": {"type": "string"}}},
+        ),
+        tool_definition_segment("read", None, None),
+    )
+    assert not c.uninspected
+
+
+def test_legacy_openai_functions_extracted():
+    """T-CONTENT-NORMALIZATION-039: legacy top-level ``functions`` entries are
+    extracted as segments, not recorded as uninspected."""
+    c = _oai(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "functions": [
+                {
+                    "name": "shell",
+                    "description": "Run a command",
+                    "parameters": {"type": "object"},
+                }
+            ],
+        }
+    )
+    assert c.tool_definitions == (
+        tool_definition_segment("shell", "Run a command", {"type": "object"}),
+    )
+    assert not c.uninspected
+
+
+def test_malformed_tool_definition_recorded_as_gap():
+    """T-CONTENT-NORMALIZATION-042: a malformed entry is a positional
+    ``tool_definitions`` gap; well-formed siblings are still extracted."""
+    c = _oai(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                "not-an-object",
+                {"type": "function"},  # no function object
+                {"type": "custom", "function": {"name": "x"}},  # not function-typed
+                {"type": "function", "function": {"name": "shell"}},
+            ],
+        }
+    )
+    assert c.tool_definitions == (tool_definition_segment("shell", None, None),)
+    assert [(gap.kind, gap.location) for gap in c.uninspected] == [
+        (GAP_TOOL_DEFINITIONS, "tools[0]"),
+        (GAP_TOOL_DEFINITIONS, "tools[1]"),
+        (GAP_TOOL_DEFINITIONS, "tools[2]"),
+    ]
+
+    ant = _ant(
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": ["not-an-object", {"name": "shell"}],
+        }
+    )
+    assert ant.tool_definitions == (tool_definition_segment("shell", None, None),)
+    assert [(gap.kind, gap.location) for gap in ant.uninspected] == [
+        (GAP_TOOL_DEFINITIONS, "tools[0]")
+    ]
 
 
 def test_image_part_recorded_uninspected():
@@ -567,8 +821,9 @@ def test_tool_call_gap_locations_are_positional():
     )
 
 
-def test_legacy_function_call_and_functions_are_gaps():
-    """VD-4: legacy ``function_call`` / ``functions`` are uninspected gaps."""
+def test_legacy_function_call_and_malformed_functions_are_gaps():
+    """VD-4: legacy ``function_call`` is an uninspected gap; a malformed legacy
+    ``functions`` entry is a positional gap (well-formed entries are extracted)."""
     oai = _oai(
         {
             "messages": [
@@ -586,10 +841,10 @@ def test_legacy_function_call_and_functions_are_gaps():
     )
 
     oai = _oai(
-        {"messages": [{"role": "user", "content": "hi"}], "functions": [{"name": "f"}]}
+        {"messages": [{"role": "user", "content": "hi"}], "functions": [42]}
     )
     assert any(
-        gap.kind == GAP_TOOL_DEFINITIONS and gap.location == "functions"
+        gap.kind == GAP_TOOL_DEFINITIONS and gap.location == "functions[0]"
         for gap in oai.uninspected
     )
 

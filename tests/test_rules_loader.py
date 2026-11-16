@@ -103,6 +103,22 @@ def test_schema_violation_rejects_only_that_rule(tmp_path):
     assert all(e["event_type"] == "rule_rejected" for e in events)
 
 
+def test_tool_definitions_target_loads_and_unknown_target_rejected(tmp_path):
+    """``tool_definitions`` is a live target; unknown targets are still rejected."""
+    _write_rules(
+        tmp_path,
+        json.dumps(_rule(id="TD", target=["tool_definitions"])),
+        json.dumps(_rule(id="BAD", target=["mystery_field"])),
+    )
+    events: list[dict] = []
+    result = load_rules(tmp_path, event_sink=events.append)
+    assert {r.id for r in result.ruleset.rules} == {"TD"}
+    assert result.rejected == 1
+    assert events[0]["event_type"] == "rule_rejected"
+    assert events[0]["id"] == "BAD"
+    assert "schema violation" in events[0]["reason"]
+
+
 def test_missing_type_payload_rejected(tmp_path):
     """T-DETECTION-RULES-003: regex without pattern; keyword without keywords."""
     no_pattern = _rule(id="NP", type="regex")

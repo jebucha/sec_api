@@ -154,6 +154,67 @@ def test_identical_tool_content_yields_identical_canonical_fields():
     assert oai_canon.tool_results == ("total 0\nfile.txt",)
 
 
+def test_identical_tool_definitions_yield_identical_canonical_field():
+    """T-CONTENT-NORMALIZATION-040: semantically identical tool definitions
+    (same names, descriptions, JSON-Schema shapes) through both formats yield
+    identical ``tool_definitions`` segments."""
+    schema = {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    }
+    oai_body = json.dumps(
+        {
+            "model": "qwen3-32b",
+            "messages": [{"role": "user", "content": "list the files"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "description": "Run a command",
+                        "parameters": schema,
+                    },
+                },
+                {"type": "function", "function": {"name": "read"}},
+            ],
+        }
+    ).encode()
+    ant_body = json.dumps(
+        {
+            "model": "llama-3.1-8b",
+            "messages": [{"role": "user", "content": "list the files"}],
+            "tools": [
+                {
+                    "name": "shell",
+                    "description": "Run a command",
+                    "input_schema": schema,
+                },
+                {"name": "read"},
+            ],
+        }
+    ).encode()
+
+    oai_canon = openai.parse_request(oai_body)
+    ant_canon = anthropic.parse_request(ant_body)
+
+    assert oai_canon.tool_definitions == ant_canon.tool_definitions
+    # sanity: the shared D3 segments, byte-identical across formats
+    assert oai_canon.tool_definitions == (
+        json.dumps(
+            {
+                "description": "Run a command",
+                "input_schema": schema,
+                "name": "shell",
+            },
+            sort_keys=True,
+        ),
+        json.dumps(
+            {"description": None, "input_schema": None, "name": "read"}, sort_keys=True
+        ),
+    )
+
+
 def test_parity_across_multipart_and_block_text():
     oai_body = json.dumps(
         {

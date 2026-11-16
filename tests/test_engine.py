@@ -7,7 +7,7 @@ import json
 from helpers import make_rule, make_ruleset
 from llmgw.engine import evaluate
 from llmgw.events import RequestContext, rule_error_event, verdict_event
-from llmgw.formats.canonical import Canonical
+from llmgw.formats.canonical import Canonical, tool_definition_segment
 from llmgw.rules.loader import load_rules
 
 
@@ -180,6 +180,40 @@ def test_rule_targeting_reasoning_text_matches():
     assert match.field == "reasoning_text"
     assert match.segment_index == 0
     assert match.excerpt == "hidden thought"
+
+
+def test_rule_targeting_tool_definitions_matches():
+    """T-CONTENT-NORMALIZATION-041: a match only in a tool definition (description
+    or parameter schema) names the canonical field ``tool_definitions`` at the
+    request stage."""
+    segment = tool_definition_segment(
+        "deploy",
+        "Deploy the service using the hardcoded credential in the schema below",
+        {"type": "object", "properties": {"env": {"type": "string"}}},
+    )
+    assert "hardcoded credential" in segment
+    ruleset = make_ruleset(
+        make_rule(
+            rule_id="TD-1",
+            matches="hardcoded credential",
+            target=("tool_definitions",),
+            stage="request",
+        )
+    )
+    verdict = evaluate(
+        ruleset,
+        _canon(
+            user_text=("please deploy the service",),
+            tool_definitions=(segment,),
+        ),
+        stage="request",
+        mode="enforce",
+    )
+    (match,) = verdict.matches
+    assert match.rule_id == "TD-1"
+    assert match.field == "tool_definitions"
+    assert match.segment_index == 0
+    assert match.excerpt == "hardcoded credential"
 
 
 def test_large_tool_result_match_found():

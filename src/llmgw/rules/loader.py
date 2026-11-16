@@ -58,6 +58,7 @@ RULE_SCHEMA: dict[str, Any] = {
                     "reasoning_text",
                     "tool_calls",
                     "tool_results",
+                    "tool_definitions",
                 ]
             },
         },

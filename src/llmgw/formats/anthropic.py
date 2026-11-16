@@ -23,6 +23,7 @@ from .canonical import (
     Canonical,
     Gap,
     tool_call_segment,
+    tool_definition_segment,
 )
 
 
@@ -190,6 +191,7 @@ def parse_request(body: bytes) -> Canonical:
     reasoning: list[str] = []
     tool_calls: list[str] = []
     tool_results: list[str] = []
+    tool_definitions: list[str] = []
     gaps: list[Gap] = []
 
     top_system = data.get("system")
@@ -233,11 +235,25 @@ def parse_request(body: bytes) -> Canonical:
                 )
             )
 
+    # Tool definitions (design D3, D4): one segment per well-formed entry;
+    # a non-object entry stays a positional gap while siblings extract.
     tools = data.get("tools")
     if isinstance(tools, list) and tools:
-        gaps.append(
-            Gap(GAP_TOOL_DEFINITIONS, "tools", "request tool definitions are not inspected in v1")
-        )
+        for tool_index, entry in enumerate(tools):
+            if not isinstance(entry, dict):
+                gaps.append(
+                    Gap(
+                        GAP_TOOL_DEFINITIONS,
+                        f"tools[{tool_index}]",
+                        "malformed tool definition entry; content was not inspected",
+                    )
+                )
+            else:
+                tool_definitions.append(
+                    tool_definition_segment(
+                        entry.get("name"), entry.get("description"), entry.get("input_schema")
+                    )
+                )
     elif tools:
         gaps.append(
             Gap(GAP_OTHER, "tools", "tools is not a list; content was not inspected")
@@ -250,6 +266,7 @@ def parse_request(body: bytes) -> Canonical:
         reasoning_text=tuple(reasoning),
         tool_calls=tuple(tool_calls),
         tool_results=tuple(tool_results),
+        tool_definitions=tuple(tool_definitions),
         uninspected=tuple(gaps),
     )
 

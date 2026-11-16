@@ -281,6 +281,75 @@ def test_starter_rules_match_sensitive_data_in_tool_result(tmp_path):
     assert by_rule["PII-001"]["excerpt"].startswith("41")
 
 
+def test_starter_rules_match_secret_in_tool_definition(tmp_path):
+    """T-DETECTION-RULES-024: a secret in a tool definition (description or
+    parameter schema, either wire format) matches at the request stage on the
+    ``tool_definitions`` field with a masked excerpt; the full value never
+    reaches the events."""
+    aws_key = "AKIAIOSFODNN7EXAMPLE"
+    common = {
+        "description": f"Authenticates with the key {aws_key} baked into the tool",
+        "schema": {"type": "object", "properties": {"env": {"type": "string"}}},
+    }
+    bodies = [
+        (
+            "oai",
+            "/v1/chat/completions",
+            {
+                "model": "qwen3-32b",
+                "messages": [{"role": "user", "content": "deploy the service"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "deploy",
+                            "description": common["description"],
+                            "parameters": common["schema"],
+                        },
+                    }
+                ],
+            },
+        ),
+        (
+            "ant",
+            "/v1/messages",
+            {
+                "model": "llama-3.1-8b",
+                "messages": [{"role": "user", "content": "deploy the service"}],
+                "tools": [
+                    {
+                        "name": "deploy",
+                        "description": common["description"],
+                        "input_schema": common["schema"],
+                    }
+                ],
+            },
+        ),
+    ]
+    for label, path, body in bodies:
+        sub = tmp_path / label
+        sub.mkdir()
+        config = make_test_config(sub, rules_dir=str(RULES_DIR), mode="enforce")
+        upstream: list[httpx.Request] = []
+        transport = httpx.MockTransport(make_upstream_handler(upstream))
+        test_app = create_app(
+            config, canary_values=[TEST_CANARY], upstream_transport=transport
+        )
+        with TestClient(test_app) as client:
+            response = client.post(path, json=body, headers=auth_headers())
+        assert response.status_code == 403
+        assert upstream == []  # blocked at the request stage, before upstream
+        events = read_events(config.events.path)
+        verdicts = [
+            event for event in events_of_type(events, "verdict") if event["stage"] == "request"
+        ]
+        assert len(verdicts) == 1
+        by_rule = {match["rule_id"]: match for match in verdicts[0]["matches"]}
+        assert by_rule["SE-001"]["field"] == "tool_definitions"
+        assert by_rule["SE-001"]["excerpt"] == "AK\u2026LE (20 chars)"
+        assert aws_key not in json.dumps(events)
+
+
 def test_starter_corpus_covers_every_category():
     """T-DETECTION-TESTING-009: starter corpus vs starter packs with the test canary."""
     report = run_replay(CORPUS_DIR, RULES_DIR, canaries=[TEST_CANARY])

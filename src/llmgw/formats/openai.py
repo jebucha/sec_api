@@ -17,6 +17,7 @@ from .canonical import (
     Canonical,
     Gap,
     tool_call_segment,
+    tool_definition_segment,
 )
 
 TEXT_LIKE_PARTS = ("text",)
@@ -35,6 +36,18 @@ def _openai_call_name_arguments(call: Any) -> tuple[str, object] | None:
     if not isinstance(name, str):
         return None
     return name, function.get("arguments")
+
+
+def _openai_tool_definition(entry: Any) -> tuple[object, object, object] | None:
+    """``(name, description, parameters)`` of a well-formed OpenAI ``tools[]``
+    entry, or None if the entry is not a ``function``-type entry with a
+    ``function`` object (design D4: such entries stay gaps)."""
+    if not isinstance(entry, dict) or entry.get("type") != "function":
+        return None
+    function = entry.get("function")
+    if not isinstance(function, dict):
+        return None
+    return function.get("name"), function.get("description"), function.get("parameters")
 
 
 def _collect_openai_tool_calls(
@@ -112,6 +125,7 @@ def parse_request(body: bytes) -> Canonical:
     reasoning: list[str] = []
     tool_calls: list[str] = []
     tool_results: list[str] = []
+    tool_definitions: list[str] = []
     gaps: list[Gap] = []
 
     messages = data.get("messages")
@@ -171,22 +185,44 @@ def parse_request(body: bytes) -> Canonical:
                         "legacy function_call is not inspected",
                     )
                 )
+    # Tool definitions (design D3, D4): one segment per well-formed entry;
+    # a malformed entry (non-object, or not a ``function``-type entry with a
+    # ``function`` object) stays a positional gap while siblings extract.
     tools = data.get("tools")
     if isinstance(tools, list) and tools:
-        gaps.append(
-            Gap(GAP_TOOL_DEFINITIONS, "tools", "request tool definitions are not inspected in v1")
-        )
+        for tool_index, entry in enumerate(tools):
+            definition = _openai_tool_definition(entry)
+            if definition is None:
+                gaps.append(
+                    Gap(
+                        GAP_TOOL_DEFINITIONS,
+                        f"tools[{tool_index}]",
+                        "malformed tool definition entry; content was not inspected",
+                    )
+                )
+            else:
+                name, description, parameters = definition
+                tool_definitions.append(tool_definition_segment(name, description, parameters))
     elif tools:
         gaps.append(Gap(GAP_OTHER, "tools", "tools is not a list; content was not inspected"))
     functions = data.get("functions")
     if isinstance(functions, list) and functions:
-        gaps.append(
-            Gap(
-                GAP_TOOL_DEFINITIONS,
-                "functions",
-                "legacy request function definitions are not inspected in v1",
-            )
-        )
+        for function_index, entry in enumerate(functions):
+            if not isinstance(entry, dict):
+                gaps.append(
+                    Gap(
+                        GAP_TOOL_DEFINITIONS,
+                        f"functions[{function_index}]",
+                        "malformed tool definition entry; content was not inspected",
+                    )
+                )
+            else:
+                # Legacy entries carry name/description/parameters directly.
+                tool_definitions.append(
+                    tool_definition_segment(
+                        entry.get("name"), entry.get("description"), entry.get("parameters")
+                    )
+                )
     elif functions:
         gaps.append(
             Gap(GAP_OTHER, "functions", "functions is not a list; content was not inspected")
@@ -199,6 +235,7 @@ def parse_request(body: bytes) -> Canonical:
         reasoning_text=tuple(reasoning),
         tool_calls=tuple(tool_calls),
         tool_results=tuple(tool_results),
+        tool_definitions=tuple(tool_definitions),
         uninspected=tuple(gaps),
     )
 
@@ -270,17 +307,35 @@ def parse_response(body: bytes) -> Canonical:
                 gaps.append(Gap(GAP_OTHER, f"choices[{index}].message", "non-object message"))
                 continue
             location = f"choices[{index}].message"
+            # ``reasoning`` is an alias of ``reasoning_content`` (design D1):
+            # per message, ``reasoning_content`` wins when both are present,
+            # so a mirroring upstream yields exactly one segment.
             reasoning_content = message.get("reasoning_content")
+            used_reasoning = False
             if reasoning_content is not None:
                 if isinstance(reasoning_content, str):
                     if reasoning_content:
                         reasoning.append(reasoning_content)
+                    used_reasoning = True
                 else:
                     gaps.append(
                         Gap(
                             GAP_UNKNOWN_PART,
                             location,
                             "non-string reasoning_content; content was not inspected",
+                        )
+                    )
+            reasoning_alias = message.get("reasoning")
+            if reasoning_alias is not None:
+                if isinstance(reasoning_alias, str) and not used_reasoning:
+                    if reasoning_alias:
+                        reasoning.append(reasoning_alias)
+                elif not isinstance(reasoning_alias, str):
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            location,
+                            "non-string reasoning; content was not inspected",
                         )
                     )
             content = message.get("content")
@@ -392,8 +447,10 @@ def extract_stream_text(raw: bytes) -> Canonical:
     """Build the canonical structure from an accumulated OpenAI SSE stream.
 
     Assistant text comes from ``choices[].delta.content``; reasoning text is
-    accumulated from ``choices[].delta.reasoning_content`` into one segment at
-    stream end. Tool calls are reconstructed from
+    accumulated from ``choices[].delta.reasoning_content`` (with the
+    OpenAI-compatible ``reasoning`` field as a per-delta alias;
+    ``reasoning_content`` preferred when both are present) into one segment
+    at stream end. Tool calls are reconstructed from
     ``choices[].delta.tool_calls`` fragments accumulated by index (design D4):
     one D1 segment per complete call at stream end.
     Protocol-only chunks (role, finish_reason) are ignored; chunks carrying
@@ -443,17 +500,35 @@ def extract_stream_text(raw: bytes) -> Canonical:
                         "non-string delta content",
                     )
                 )
+            # ``reasoning`` is an alias of ``reasoning_content`` (design D1):
+            # per delta, ``reasoning_content`` wins when both are present, so
+            # a mirroring upstream accumulates exactly one reasoning segment.
             reasoning_content = delta.get("reasoning_content")
-            if isinstance(reasoning_content, str):
-                reasoning_parts.append(reasoning_content)
-            elif reasoning_content is not None:
-                gaps.append(
-                    Gap(
-                        GAP_UNKNOWN_PART,
-                        f"choices[{index}].delta.reasoning_content",
-                        "non-string reasoning_content delta",
+            used_reasoning = False
+            if reasoning_content is not None:
+                if isinstance(reasoning_content, str):
+                    reasoning_parts.append(reasoning_content)
+                    used_reasoning = True
+                else:
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            f"choices[{index}].delta.reasoning_content",
+                            "non-string reasoning_content delta",
+                        )
                     )
-                )
+            reasoning_alias = delta.get("reasoning")
+            if reasoning_alias is not None:
+                if isinstance(reasoning_alias, str) and not used_reasoning:
+                    reasoning_parts.append(reasoning_alias)
+                elif not isinstance(reasoning_alias, str):
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            f"choices[{index}].delta.reasoning",
+                            "non-string reasoning delta",
+                        )
+                    )
             delta_tool_calls = delta.get("tool_calls")
             if delta_tool_calls is not None:
                 if isinstance(delta_tool_calls, list):
@@ -472,7 +547,8 @@ def extract_stream_text(raw: bytes) -> Canonical:
                     )
             non_text = {
                 key for key in delta
-                if key not in ("role", "content", "reasoning_content", "tool_calls")
+                if key
+                not in ("role", "content", "reasoning_content", "reasoning", "tool_calls")
                 and delta[key] is not None
             }
             if non_text:

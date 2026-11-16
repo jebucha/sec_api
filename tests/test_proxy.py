@@ -320,13 +320,24 @@ def test_fail_closed_blocks_image_without_upstream_contact(tmp_path):
 
 
 def test_fail_closed_forwards_inspected_tool_content(tmp_path):
-    """T-CONTENT-NORMALIZATION-015: tool calls/results are inspected, not gapped."""
+    """T-CONTENT-NORMALIZATION-015: tool calls/results/definitions are inspected,
+    not gapped."""
     config = make_test_config(tmp_path, uninspected_policy="fail_closed")
     ensure_rules_dir(config)
     records: list[httpx.Request] = []
     app = create_app(config, upstream_transport=httpx.MockTransport(make_upstream_handler(records)))
     body = {
         "model": "qwen3-32b",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a command",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
         "messages": [
             {"role": "user", "content": "list the files"},
             {
@@ -349,7 +360,7 @@ def test_fail_closed_forwards_inspected_tool_content(tmp_path):
     assert len(records) == 1
     events = read_events(config.events.path)
     gaps = events_of_type(events, "uninspected_content")
-    assert not gaps  # no tool_call/tool_result gaps, no other uninspected content
+    assert not gaps  # no tool gaps, no other uninspected content
 
 
 def test_flag_policy_forwards_image_and_records_event(tmp_path):
@@ -419,9 +430,11 @@ def test_distinct_gaps_emit_separate_events_with_count_one(tmp_path):
         response = client.post("/v1/chat/completions", json=body, headers=auth_headers())
     assert response.status_code == 200
     gaps = events_of_type(read_events(config.events.path), "uninspected_content")
+    # the malformed tools[0] entry (no function object) is a positional
+    # tool_definitions gap (design D4), not a blanket "tools" gap
     assert [(gap["kind"], gap["location"], gap["stage"], gap["count"]) for gap in gaps] == [
         ("image", "messages[0].content[1]", "request", 1),
-        ("tool_definitions", "tools", "request", 1),
+        ("tool_definitions", "tools[0]", "request", 1),
     ]
 
 

@@ -33,7 +33,8 @@
           "assistant_text",
           "reasoning_text",
           "tool_calls",
-          "tool_results"
+          "tool_results",
+          "tool_definitions"
         ]
       }
     },

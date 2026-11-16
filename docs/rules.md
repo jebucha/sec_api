@@ -19,7 +19,7 @@ the file, line, rule id (if parseable), and reason.
 | `name` | yes | string | Human-readable name. |
 | `version` | yes | string | Rule version (bump on change). |
 | `stage` | yes | `request` \| `response` | Stage at which the rule is evaluated. |
-| `target` | yes | non-empty list | Canonical fields to evaluate: `system`, `user_text`, `assistant_text`, `reasoning_text`, `tool_calls`, `tool_results`. |
+| `target` | yes | non-empty list | Canonical fields to evaluate: `system`, `user_text`, `assistant_text`, `reasoning_text`, `tool_calls`, `tool_results`, `tool_definitions`. |
 | `type` | yes | `regex` \| `keyword` \| `heuristic` | Matcher type; determines the payload. |
 | `severity` | yes | `low` \| `medium` \| `high` \| `critical` | Advisory severity, recorded in events. |
 | `action` | yes | `block` \| `flag` \| `log` | Action on match. Precedence `block > flag > log`; the stage verdict is the most severe action among all matches. |
@@ -50,10 +50,25 @@ The `tool_calls` and `tool_results` targets are live in both formats.
   block / text part). Segments are inspected in full. Tool results are
   request-stage content only: a response carries no tool results, so a
   response-stage rule targeting `tool_results` has nothing to inspect.
+- `tool_definitions`: one segment per tool definition (design D3) — a single
+  JSON object with sorted keys,
+  `{"description": <description>, "input_schema": <parameter schema>, "name": <tool name>}`,
+  where `input_schema` is the JSON-Schema parameter object (OpenAI's
+  `function.parameters`, or Anthropic's `input_schema`); a missing description
+  or schema serializes as `null`. OpenAI `tools[].function` entries and
+  legacy top-level `functions[]` entries, and Anthropic `tools[]` entries,
+  all normalize to the same segment, so semantically identical definitions
+  are byte-identical across formats and one pattern sees the tool's identity,
+  documented behavior, and accepted parameters together. Tool definitions are
+  request-stage content only: a response carries no tool definitions, so a
+  response-stage rule targeting `tool_definitions` has nothing to inspect.
 
-Tool definitions (`tools[]`), images, and malformed tool or reasoning content
-remain uninspected. They are recorded as `uninspected_content` events, not
-rule targets. At each stage, duplicate gaps (same kind, location, and detail)
+Images and malformed tool or reasoning content remain uninspected. A
+malformed tool definition entry — a non-object `tools[]`/`functions[]` entry,
+or an OpenAI `tools[]` object that is not a `function`-type entry with a
+`function` object — is recorded as an `uninspected_content` event of kind
+`tool_definitions` at its position, while well-formed siblings are still
+extracted. At each stage, duplicate gaps (same kind, location, and detail)
 are collapsed into one event carrying a `count` of the gaps it aggregates
 (`count: 1` for a single gap), so streamed traffic does not emit one event per
 chunk.
@@ -66,7 +81,10 @@ content, one segment per reasoning message or accumulated stream:
 
 - OpenAI: `message.reasoning_content` in a response or request-history message;
   streamed `delta.reasoning_content` fragments are concatenated into one
-  segment.
+  segment. The OpenAI-compatible `reasoning` field is an alias of
+  `reasoning_content`: when both are present on the same message or delta,
+  the `reasoning_content` value is used and the alias ignored, so an upstream
+  that mirrors its reasoning into both fields produces exactly one segment.
 - Anthropic: `thinking` content blocks in a response or request-history
   message; streamed `thinking_delta` fragments are concatenated into one
   segment per block. `signature_delta` events are protocol-only (thinking
@@ -176,6 +194,10 @@ built, so unmasked values never reach the event stream.
 
 ```json
 {"id": "TR-001", "name": "Exfiltration marker in tool output", "version": "1", "stage": "request", "target": ["tool_results"], "type": "keyword", "severity": "high", "action": "block", "enabled": true, "description": "A marker string planted in tool output (file contents, command output, web fetches).", "keywords": ["EXFIL-TOOL-RESULT"], "tests": {"match": ["fetched page contains EXFIL-TOOL-RESULT"], "no_match": ["clean tool output"]}}
+```
+
+```json
+{"id": "TD-001", "name": "Hardcoded credential in tool schema", "version": "1", "stage": "request", "target": ["tool_definitions"], "type": "regex", "severity": "high", "action": "block", "enabled": true, "description": "A credential hardcoded in a tool description or parameter schema. tool_definitions segments are the JSON object {\"description\": ..., \"input_schema\": ..., \"name\": ...} with sorted keys, so one pattern sees the tool's identity and schema together.", "mask_excerpt": true, "pattern": "\\bAKIA[0-9A-Z]{16}\\b", "tests": {"match": ["{\"description\": \"authenticates with AKIAIOSFODNN7EXAMPLE\", \"input_schema\": null, \"name\": \"auth\"}"], "no_match": ["{\"description\": \"lists files\", \"input_schema\": null, \"name\": \"shell\"}"]}}
 ```
 
 ```json
