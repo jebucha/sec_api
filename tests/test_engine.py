@@ -155,6 +155,33 @@ def test_disabled_rule_not_evaluated(tmp_path):
     assert verdict.action == "flag"  # the disabled block rule did not fire
 
 
+def test_rule_targeting_reasoning_text_matches():
+    """T-CONTENT-NORMALIZATION-030: a match only in reasoning content names
+    the canonical field ``reasoning_text``."""
+    ruleset = make_ruleset(
+        make_rule(
+            rule_id="RT-1",
+            matches="hidden thought",
+            target=("reasoning_text",),
+            stage="response",
+        )
+    )
+    verdict = evaluate(
+        ruleset,
+        _canon(
+            assistant_text=("visible answer",),
+            reasoning_text=("the hidden thought",),
+        ),
+        stage="response",
+        mode="enforce",
+    )
+    (match,) = verdict.matches
+    assert match.rule_id == "RT-1"
+    assert match.field == "reasoning_text"
+    assert match.segment_index == 0
+    assert match.excerpt == "hidden thought"
+
+
 def test_large_tool_result_match_found():
     """T-CONTENT-NORMALIZATION-023: a 1 MB segment is inspected in full."""
     pattern = "needle-near-the-end"

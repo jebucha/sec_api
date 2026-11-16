@@ -23,7 +23,7 @@ active rules; it changes whenever any rule changes).
 
 ```
 llmgw-replay (offline)
-ruleset: 224951a6d389  active rules: 16  canaries: LLMGW-TEST-CANARY-0000
+ruleset: 4b9be5c5dd27  active rules: 16  canaries: LLMGW-TEST-CANARY-0000
 entries: 29  evaluated: 29  invalid lines: 0
 
 overall       tp=17  fn=0  fp=0  tn=12  detection=1.0  fp_rate=0.0

@@ -97,10 +97,24 @@ def _block_response(
 
 
 def _emit_gaps(writer: EventWriter, ctx: RequestContext, canonical: Canonical, stage: str) -> None:
+    """Emit one ``uninspected_content`` event per unique gap at this stage.
+
+    Gaps are grouped by (kind, location, detail) with insertion order
+    preserved; each event carries the number of gaps it aggregates.
+    """
+    counts: dict[tuple[str, str, str], int] = {}
     for gap in canonical.uninspected:
+        key = (gap.kind, gap.location, gap.detail)
+        counts[key] = counts.get(key, 0) + 1
+    for (kind, location, detail), count in counts.items():
         writer.emit(
             uninspected_content_event(
-                ctx, kind=gap.kind, location=gap.location, detail=gap.detail, stage=stage
+                ctx,
+                kind=kind,
+                location=location,
+                detail=detail,
+                stage=stage,
+                count=count,
             )
         )
 

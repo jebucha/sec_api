@@ -134,6 +134,130 @@ def test_response_text_in_assistant_text():
     assert anthropic.parse_response(ant_body).assistant_text == ("hello",)
 
 
+# --- reasoning content extraction ---------------------------------------------
+
+
+def test_openai_response_reasoning_content_extracted():
+    """T-CONTENT-NORMALIZATION-025: message.reasoning_content is a segment."""
+    body = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "The answer is 4.",
+                        "reasoning_content": "I should add 2 and 2.",
+                    }
+                }
+            ]
+        }
+    ).encode()
+    c = openai.parse_response(body)
+    assert c.assistant_text == ("The answer is 4.",)
+    assert c.reasoning_text == ("I should add 2 and 2.",)
+    assert c.uninspected == ()
+
+
+def test_openai_stream_reasoning_deltas_accumulated():
+    """T-CONTENT-NORMALIZATION-026: delta.reasoning_content fragments join into
+    one segment and are not recorded as non-text delta gaps."""
+    stream = (
+        b'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        b'data: {"choices":[{"delta":{"reasoning_content":"Let me "}}]}\n\n'
+        b'data: {"choices":[{"delta":{"reasoning_content":"think about it."}}]}\n\n'
+        b'data: {"choices":[{"delta":{"content":"The answer is 4."}}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    c = openai.extract_stream_text(stream)
+    assert c.assistant_text == ("The answer is 4.",)
+    assert c.reasoning_text == ("Let me think about it.",)
+    assert c.uninspected == ()
+
+
+def test_malformed_reasoning_content_recorded_as_gap():
+    """T-CONTENT-NORMALIZATION-033: non-string reasoning text is an
+    unknown_part gap at the message/block location; the rest parses normally."""
+    oai = _oai(
+        {
+            "messages": [
+                {"role": "assistant", "content": "answer", "reasoning_content": 42}
+            ]
+        }
+    )
+    assert oai.assistant_text == ("answer",)
+    assert oai.reasoning_text == ()
+    assert [(gap.kind, gap.location) for gap in oai.uninspected] == [
+        (GAP_UNKNOWN_PART, "messages[0]")
+    ]
+
+    ant = anthropic.parse_response(
+        json.dumps(
+            {
+                "content": [
+                    {"type": "thinking", "thinking": 42},
+                    {"type": "text", "text": "answer"},
+                ]
+            }
+        ).encode()
+    )
+    assert ant.assistant_text == ("answer",)
+    assert ant.reasoning_text == ()
+    assert [(gap.kind, gap.location) for gap in ant.uninspected] == [
+        (GAP_UNKNOWN_PART, "content[0]")
+    ]
+
+
+def test_anthropic_response_thinking_blocks_extracted():
+    """T-CONTENT-NORMALIZATION-027: one reasoning segment per thinking block."""
+    body = json.dumps(
+        {
+            "content": [
+                {"type": "thinking", "thinking": "First thought."},
+                {"type": "text", "text": "The answer is 4."},
+                {"type": "thinking", "thinking": "Second thought."},
+            ]
+        }
+    ).encode()
+    c = anthropic.parse_response(body)
+    assert c.assistant_text == ("The answer is 4.",)
+    assert c.reasoning_text == ("First thought.", "Second thought.")
+    assert c.uninspected == ()
+
+
+def test_anthropic_stream_thinking_reconstructed():
+    """T-CONTENT-NORMALIZATION-028: thinking deltas join into one segment;
+    signature_delta is protocol-only and produces no gap."""
+    stream = (
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":0,"content_block":'
+        b'{"type":"thinking","thinking":""}}\n\n'
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,"delta":'
+        b'{"type":"thinking_delta","thinking":"Let me "}}\n\n'
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,"delta":'
+        b'{"type":"thinking_delta","thinking":"think about it."}}\n\n'
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,"delta":'
+        b'{"type":"signature_delta","signature":"c2lnbmF0dXJl"}}\n\n'
+        b"event: content_block_stop\n"
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":1,"content_block":'
+        b'{"type":"text","text":""}}\n\n'
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":1,"delta":'
+        b'{"type":"text_delta","text":"The answer is 4."}}\n\n'
+        b"event: content_block_stop\n"
+        b'data: {"type":"content_block_stop","index":1}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+    c = anthropic.extract_stream_text(stream)
+    assert c.assistant_text == ("The answer is 4.",)
+    assert c.reasoning_text == ("Let me think about it.",)
+    assert c.uninspected == ()
+
+
 # --- tool-call segment builder (1.1) ------------------------------------------
 
 def test_tool_call_segment_name_and_object():

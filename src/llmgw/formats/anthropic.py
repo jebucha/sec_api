@@ -31,7 +31,9 @@ def _gap_kind_for_block(block: Any) -> tuple[str, str]:
 
     ``tool_use`` blocks normally become ``tool_calls`` segments; this is only
     reached when the block is malformed or the context does not collect tool
-    calls (e.g. a response body).
+    calls (e.g. a response body). ``thinking`` blocks are handled by
+    :func:`_route_block`; they reach this helper only when the context does
+    not collect reasoning text.
     """
     if not isinstance(block, dict):
         return GAP_UNKNOWN_PART, "non-object block"
@@ -91,9 +93,21 @@ def _route_block(
     bucket: list[str],
     tool_calls: list[str] | None,
     tool_results: list[str] | None,
+    reasoning: list[str] | None = None,
 ) -> list[Gap]:
-    """Route one content block: text to ``bucket``, well-formed tool blocks to
-    their canonical fields, everything uninspected to a gap."""
+    """Route one content block: text to ``bucket``, ``thinking`` text to
+    ``reasoning``, well-formed tool blocks to their canonical fields,
+    everything uninspected to a gap."""
+    if isinstance(block, dict) and block.get("type") == "thinking":
+        if reasoning is None:
+            kind, detail = _gap_kind_for_block(block)
+            return [Gap(kind, location, detail)]
+        text = block.get("thinking")
+        if isinstance(text, str):
+            if text:
+                reasoning.append(text)
+            return []
+        return [Gap(GAP_UNKNOWN_PART, location, "non-string thinking block")]
     if isinstance(block, dict) and block.get("type") == "text":
         text = block.get("text")
         if isinstance(text, str):
@@ -127,9 +141,11 @@ def _parse_blocks(
     bucket: list[str],
     tool_calls: list[str] | None = None,
     tool_results: list[str] | None = None,
+    reasoning: list[str] | None = None,
 ) -> list[Gap]:
-    """Extract text from Anthropic content (string or blocks array); tool
-    blocks route to ``tool_calls``/``tool_results`` when collectors are given."""
+    """Extract text from Anthropic content (string or blocks array); thinking
+    blocks route to ``reasoning`` and tool blocks to
+    ``tool_calls``/``tool_results`` when collectors are given."""
     gaps: list[Gap] = []
     if isinstance(content, str):
         if content:
@@ -141,7 +157,14 @@ def _parse_blocks(
         return gaps
     for index, block in enumerate(content):
         gaps.extend(
-            _route_block(block, f"{location}.content[{index}]", bucket, tool_calls, tool_results)
+            _route_block(
+                block,
+                f"{location}.content[{index}]",
+                bucket,
+                tool_calls,
+                tool_results,
+                reasoning,
+            )
         )
     return gaps
 
@@ -164,6 +187,7 @@ def parse_request(body: bytes) -> Canonical:
     system: list[str] = []
     user: list[str] = []
     assistant: list[str] = []
+    reasoning: list[str] = []
     tool_calls: list[str] = []
     tool_results: list[str] = []
     gaps: list[Gap] = []
@@ -198,7 +222,16 @@ def parse_request(body: bytes) -> Canonical:
             if content is None:
                 continue
             bucket = user if role == "user" else assistant
-            gaps.extend(_parse_blocks(content, location, bucket, tool_calls, tool_results))
+            gaps.extend(
+                _parse_blocks(
+                    content,
+                    location,
+                    bucket,
+                    tool_calls,
+                    tool_results,
+                    reasoning=reasoning,
+                )
+            )
 
     tools = data.get("tools")
     if isinstance(tools, list) and tools:
@@ -214,6 +247,7 @@ def parse_request(body: bytes) -> Canonical:
         system=tuple(system),
         user_text=tuple(user),
         assistant_text=tuple(assistant),
+        reasoning_text=tuple(reasoning),
         tool_calls=tuple(tool_calls),
         tool_results=tuple(tool_results),
         uninspected=tuple(gaps),
@@ -230,6 +264,7 @@ def parse_response(body: bytes) -> Canonical:
         raise FormatError("response body must be a JSON object")
 
     assistant: list[str] = []
+    reasoning: list[str] = []
     tool_calls: list[str] = []
     gaps: list[Gap] = []
     content = data.get("content")
@@ -239,10 +274,17 @@ def parse_response(body: bytes) -> Canonical:
         for index, block in enumerate(content):
             # Response stage: tool_use blocks are extracted; tool_result
             # blocks do not occur in assistant responses and stay a gap.
-            gaps.extend(_route_block(block, f"content[{index}]", assistant, tool_calls, None))
+            gaps.extend(
+                _route_block(
+                    block, f"content[{index}]", assistant, tool_calls, None, reasoning
+                )
+            )
 
     return Canonical(
-        assistant_text=tuple(assistant), tool_calls=tuple(tool_calls), uninspected=tuple(gaps)
+        assistant_text=tuple(assistant),
+        reasoning_text=tuple(reasoning),
+        tool_calls=tuple(tool_calls),
+        uninspected=tuple(gaps),
     )
 
 
@@ -250,6 +292,9 @@ def extract_stream_text(raw: bytes) -> Canonical:
     """Build the canonical structure from an accumulated Anthropic SSE stream.
 
     Assistant text comes from ``content_block_delta.delta.text`` (text_delta).
+    ``thinking`` blocks are reconstructed across ``content_block_start`` /
+    ``thinking_delta`` / ``content_block_stop`` events into one reasoning
+    segment per block; ``signature_delta`` is protocol-only and ignored.
     ``tool_use`` blocks are reconstructed across ``content_block_start`` /
     ``input_json_delta`` / ``content_block_stop`` events (design D4): one D1
     segment per block. Protocol-only events (ping, message_stop) are ignored;
@@ -257,11 +302,14 @@ def extract_stream_text(raw: bytes) -> Canonical:
     uninspected.
     """
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     gaps: list[Gap] = []
     tool_call_segments: list[str] = []
     # Open tool_use slots keyed by block index:
     # {"name": str, "json": str, "input": object | None}
     tool_slots: dict[int, dict] = {}
+    # Open thinking slots keyed by block index: accumulated fragments.
+    reasoning_slots: dict[int, list[str]] = {}
 
     def close_slot(index: int) -> None:
         slot = tool_slots.pop(index, None)
@@ -271,6 +319,13 @@ def extract_stream_text(raw: bytes) -> Canonical:
             # an inspectable segment instead of "input": null.
             arguments = slot["json"] or slot["input"]
             tool_call_segments.append(tool_call_segment(slot["name"], arguments))
+
+    def close_reasoning_slot(index: int) -> None:
+        fragments = reasoning_slots.pop(index, None)
+        if fragments is not None:
+            text = "".join(fragments)
+            if text:
+                reasoning_parts.append(text)
 
     for event, data in iter_sse_json(raw):
         if data is None:
@@ -286,6 +341,36 @@ def extract_stream_text(raw: bytes) -> Canonical:
             btype = block.get("type")
             if btype == "text":
                 continue  # text arrives via text_delta events
+            if btype == "thinking":
+                index = data.get("index")
+                if (
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or index < 0
+                ):
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            "content_block_start",
+                            "malformed thinking block start; content was not inspected",
+                        )
+                    )
+                else:
+                    initial = block.get("thinking")
+                    fragments: list[str] = []
+                    if isinstance(initial, str):
+                        if initial:
+                            fragments.append(initial)
+                    elif initial is not None:
+                        gaps.append(
+                            Gap(
+                                GAP_UNKNOWN_PART,
+                                "content_block_start",
+                                "non-string thinking block start",
+                            )
+                        )
+                    reasoning_slots[index] = fragments
+                continue
             if btype == "tool_use":
                 index = data.get("index")
                 name = block.get("name")
@@ -328,6 +413,28 @@ def extract_stream_text(raw: bytes) -> Canonical:
                         Gap(GAP_OTHER, "content_block_delta", "non-string text delta")
                     )
                 continue
+            if dtype == "thinking_delta":
+                slot = reasoning_slots.get(data.get("index"))
+                if slot is None:
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            "content_block_delta",
+                            "thinking_delta without an open thinking block",
+                        )
+                    )
+                    continue
+                text = delta.get("thinking")
+                if isinstance(text, str):
+                    slot.append(text)
+                else:
+                    gaps.append(
+                        Gap(GAP_UNKNOWN_PART, "content_block_delta", "non-string thinking delta")
+                    )
+                continue
+            if dtype == "signature_delta":
+                # Cryptographic signature of the thinking block, not content.
+                continue
             if dtype == "input_json_delta":
                 slot = tool_slots.get(data.get("index"))
                 if slot is None:
@@ -356,7 +463,9 @@ def extract_stream_text(raw: bytes) -> Canonical:
             )
             continue
         if event == "content_block_stop":
-            close_slot(data.get("index"))
+            index = data.get("index")
+            close_slot(index)
+            close_reasoning_slot(index)
             continue
         if event in ("ping", "message_stop", "message_delta", "message_start"):
             # Protocol events without inspectable content.
@@ -369,9 +478,13 @@ def extract_stream_text(raw: bytes) -> Canonical:
     # accumulated; the proxy adds the stream_error gap for the interruption.
     for index in sorted(tool_slots):
         close_slot(index)
+    for index in sorted(reasoning_slots):
+        close_reasoning_slot(index)
     full_text = "".join(text_parts)
+    full_reasoning = "".join(reasoning_parts)
     return Canonical(
         assistant_text=(full_text,) if full_text else (),
+        reasoning_text=(full_reasoning,) if full_reasoning else (),
         tool_calls=tuple(tool_call_segments),
         uninspected=tuple(gaps),
     )

@@ -16,7 +16,7 @@ beginning with `//` are ignored.
 | `label` | yes | `malicious` \| `benign` | Ground truth. |
 | `category` | yes | string | The starter pack category, e.g. `prompt-injection`. |
 | `expected_rules` | no | list of rule ids | Rules expected to match this entry (per-rule true positives/false negatives). |
-| `field` | no | `system` \| `user_text` \| `assistant_text` | Canonical field the text is placed in. Default `user_text`. |
+| `field` | no | `system` \| `user_text` \| `assistant_text` \| `reasoning_text` | Canonical field the text is placed in. Default `user_text`. |
 | `stage` | no | `request` \| `response` | Stage the entry is evaluated at. Default `request`. |
 | `format` | no | `openai` \| `anthropic` | Wire format for live mode. Default `openai`; ignored offline. |
 

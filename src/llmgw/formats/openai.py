@@ -109,6 +109,7 @@ def parse_request(body: bytes) -> Canonical:
     system: list[str] = []
     user: list[str] = []
     assistant: list[str] = []
+    reasoning: list[str] = []
     tool_calls: list[str] = []
     tool_results: list[str] = []
     gaps: list[Gap] = []
@@ -147,6 +148,19 @@ def parse_request(body: bytes) -> Canonical:
             content = message.get("content")
             if content is not None:
                 gaps.extend(_route_content(content, role, location, system, user, assistant))
+            reasoning_content = message.get("reasoning_content")
+            if reasoning_content is not None:
+                if isinstance(reasoning_content, str):
+                    if reasoning_content:
+                        reasoning.append(reasoning_content)
+                else:
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            location,
+                            "non-string reasoning_content; content was not inspected",
+                        )
+                    )
             tool_calls_field = message.get("tool_calls")
             _collect_openai_tool_calls(tool_calls_field, location, tool_calls, gaps)
             if message.get("function_call"):
@@ -182,6 +196,7 @@ def parse_request(body: bytes) -> Canonical:
         system=tuple(system),
         user_text=tuple(user),
         assistant_text=tuple(assistant),
+        reasoning_text=tuple(reasoning),
         tool_calls=tuple(tool_calls),
         tool_results=tuple(tool_results),
         uninspected=tuple(gaps),
@@ -228,6 +243,7 @@ def parse_response(body: bytes) -> Canonical:
         raise FormatError("response body must be a JSON object")
 
     assistant: list[str] = []
+    reasoning: list[str] = []
     tool_calls: list[str] = []
     gaps: list[Gap] = []
     choices = data.get("choices")
@@ -254,6 +270,19 @@ def parse_response(body: bytes) -> Canonical:
                 gaps.append(Gap(GAP_OTHER, f"choices[{index}].message", "non-object message"))
                 continue
             location = f"choices[{index}].message"
+            reasoning_content = message.get("reasoning_content")
+            if reasoning_content is not None:
+                if isinstance(reasoning_content, str):
+                    if reasoning_content:
+                        reasoning.append(reasoning_content)
+                else:
+                    gaps.append(
+                        Gap(
+                            GAP_UNKNOWN_PART,
+                            location,
+                            "non-string reasoning_content; content was not inspected",
+                        )
+                    )
             content = message.get("content")
             if isinstance(content, str):
                 if content:
@@ -281,7 +310,10 @@ def parse_response(body: bytes) -> Canonical:
                 )
 
     return Canonical(
-        assistant_text=tuple(assistant), tool_calls=tuple(tool_calls), uninspected=tuple(gaps)
+        assistant_text=tuple(assistant),
+        reasoning_text=tuple(reasoning),
+        tool_calls=tuple(tool_calls),
+        uninspected=tuple(gaps),
     )
 
 
@@ -359,14 +391,17 @@ def _finalize_openai_calls(
 def extract_stream_text(raw: bytes) -> Canonical:
     """Build the canonical structure from an accumulated OpenAI SSE stream.
 
-    Assistant text comes from ``choices[].delta.content``. Tool calls are
-    reconstructed from ``choices[].delta.tool_calls`` fragments accumulated
-    by index (design D4): one D1 segment per complete call at stream end.
+    Assistant text comes from ``choices[].delta.content``; reasoning text is
+    accumulated from ``choices[].delta.reasoning_content`` into one segment at
+    stream end. Tool calls are reconstructed from
+    ``choices[].delta.tool_calls`` fragments accumulated by index (design D4):
+    one D1 segment per complete call at stream end.
     Protocol-only chunks (role, finish_reason) are ignored; chunks carrying
     uninspectable content (error objects, non-accumulatable tool-call
     fragments, other non-text delta fields) are recorded as uninspected.
     """
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     gaps: list[Gap] = []
     call_names: dict[int, str] = {}
     call_args: dict[int, list[str]] = {}
@@ -408,6 +443,17 @@ def extract_stream_text(raw: bytes) -> Canonical:
                         "non-string delta content",
                     )
                 )
+            reasoning_content = delta.get("reasoning_content")
+            if isinstance(reasoning_content, str):
+                reasoning_parts.append(reasoning_content)
+            elif reasoning_content is not None:
+                gaps.append(
+                    Gap(
+                        GAP_UNKNOWN_PART,
+                        f"choices[{index}].delta.reasoning_content",
+                        "non-string reasoning_content delta",
+                    )
+                )
             delta_tool_calls = delta.get("tool_calls")
             if delta_tool_calls is not None:
                 if isinstance(delta_tool_calls, list):
@@ -426,7 +472,8 @@ def extract_stream_text(raw: bytes) -> Canonical:
                     )
             non_text = {
                 key for key in delta
-                if key not in ("role", "content", "tool_calls") and delta[key] is not None
+                if key not in ("role", "content", "reasoning_content", "tool_calls")
+                and delta[key] is not None
             }
             if non_text:
                 kind = GAP_TOOL_CALL if "function_call" in non_text else GAP_UNKNOWN_PART
@@ -435,8 +482,10 @@ def extract_stream_text(raw: bytes) -> Canonical:
                 )
     tool_calls = _finalize_openai_calls(call_names, call_args, open_indices, gaps)
     full_text = "".join(text_parts)
+    full_reasoning = "".join(reasoning_parts)
     return Canonical(
         assistant_text=(full_text,) if full_text else (),
+        reasoning_text=(full_reasoning,) if full_reasoning else (),
         tool_calls=tuple(tool_calls),
         uninspected=tuple(gaps),
     )

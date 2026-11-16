@@ -19,7 +19,7 @@ the file, line, rule id (if parseable), and reason.
 | `name` | yes | string | Human-readable name. |
 | `version` | yes | string | Rule version (bump on change). |
 | `stage` | yes | `request` \| `response` | Stage at which the rule is evaluated. |
-| `target` | yes | non-empty list | Canonical fields to evaluate: `system`, `user_text`, `assistant_text`, `tool_calls`, `tool_results`. |
+| `target` | yes | non-empty list | Canonical fields to evaluate: `system`, `user_text`, `assistant_text`, `reasoning_text`, `tool_calls`, `tool_results`. |
 | `type` | yes | `regex` \| `keyword` \| `heuristic` | Matcher type; determines the payload. |
 | `severity` | yes | `low` \| `medium` \| `high` \| `critical` | Advisory severity, recorded in events. |
 | `action` | yes | `block` \| `flag` \| `log` | Action on match. Precedence `block > flag > log`; the stage verdict is the most severe action among all matches. |
@@ -51,8 +51,31 @@ The `tool_calls` and `tool_results` targets are live in both formats.
   request-stage content only: a response carries no tool results, so a
   response-stage rule targeting `tool_results` has nothing to inspect.
 
-Tool definitions (`tools[]`), images, and malformed tool content remain
-uninspected (they are `uninspected_content` events, not rule targets).
+Tool definitions (`tools[]`), images, and malformed tool or reasoning content
+remain uninspected. They are recorded as `uninspected_content` events, not
+rule targets. At each stage, duplicate gaps (same kind, location, and detail)
+are collapsed into one event carrying a `count` of the gaps it aggregates
+(`count: 1` for a single gap), so streamed traffic does not emit one event per
+chunk.
+
+## Reasoning content segments
+
+The `reasoning_text` target is live in both formats, at both stages, for
+non-streamed and streamed traffic. It carries model reasoning (chain-of-thought)
+content, one segment per reasoning message or accumulated stream:
+
+- OpenAI: `message.reasoning_content` in a response or request-history message;
+  streamed `delta.reasoning_content` fragments are concatenated into one
+  segment.
+- Anthropic: `thinking` content blocks in a response or request-history
+  message; streamed `thinking_delta` fragments are concatenated into one
+  segment per block. `signature_delta` events are protocol-only (thinking
+  signatures, not content) and are ignored.
+
+Reasoning content is inspected in full like any other text field. Non-string
+`reasoning_content` / `thinking` values are malformed and remain uninspected.
+A canary echoed in reasoning content is detected by the starter prompt-leak
+rule `PL-001`, which targets both `assistant_text` and `reasoning_text`.
 
 ## Per-type payloads
 

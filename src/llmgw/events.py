@@ -156,10 +156,17 @@ def uninspected_content_event(
     location: str,
     detail: str = "",
     stage: str | None = None,
+    count: int = 1,
 ) -> dict[str, Any]:
-    """An ``uninspected_content`` event for a gap in the canonical structure."""
+    """An ``uninspected_content`` event for a gap in the canonical structure.
+
+    Duplicate gaps (same kind, location, and detail) are aggregated per stage;
+    ``count`` is the number of gaps represented by this event.
+    """
     event = ctx.envelope("uninspected_content")
-    event.update({"kind": kind, "location": location, "detail": detail, "stage": stage})
+    event.update(
+        {"kind": kind, "location": location, "detail": detail, "stage": stage, "count": count}
+    )
     return event
 
 

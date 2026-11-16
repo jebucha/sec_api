@@ -51,7 +51,14 @@ RULE_SCHEMA: dict[str, Any] = {
             "type": "array",
             "minItems": 1,
             "items": {
-                "enum": ["system", "user_text", "assistant_text", "tool_calls", "tool_results"]
+                "enum": [
+                    "system",
+                    "user_text",
+                    "assistant_text",
+                    "reasoning_text",
+                    "tool_calls",
+                    "tool_results",
+                ]
             },
         },
         "type": {"enum": ["regex", "keyword", "heuristic"]},

@@ -7,12 +7,15 @@ and a pattern cannot match across a message boundary.
 
 ``tool_calls`` carries one JSON segment per tool call (see
 :func:`tool_call_segment`); ``tool_results`` carries one segment per tool
-result text. The format parsers populate both at the request and response
-stages, and they are inspected like any other canonical field. The gap kinds
-that remain uninspected are: tool definitions (``tools[]``/``functions``),
-images, unknown part types, legacy ``function_call`` fields, malformed tool
-content (non-list ``tool_calls``, non-object call entries, unparseable
-stream fragments), and stream issues.
+result text; ``reasoning_text`` carries one segment per model reasoning
+message (OpenAI ``reasoning_content`` or Anthropic ``thinking``). The format
+parsers populate them at the request and response stages, and they are
+inspected like any other canonical field. The gap kinds that remain
+uninspected are: tool definitions (``tools[]``/``functions``), images,
+unknown part types, legacy ``function_call`` fields, malformed tool content
+(non-list ``tool_calls``, non-object call entries, unparseable stream
+fragments), malformed reasoning content (non-string ``reasoning_content`` or
+``thinking`` text), and stream issues.
 """
 
 from __future__ import annotations
@@ -20,7 +23,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-CANONICAL_FIELDS = ("system", "user_text", "assistant_text", "tool_calls", "tool_results")
+CANONICAL_FIELDS = (
+    "system",
+    "user_text",
+    "assistant_text",
+    "reasoning_text",
+    "tool_calls",
+    "tool_results",
+)
 
 # Gap kinds for uninspected content
 GAP_TOOL_CALL = "tool_call"
@@ -65,6 +75,7 @@ class Canonical:
     system: tuple[str, ...] = ()
     user_text: tuple[str, ...] = ()
     assistant_text: tuple[str, ...] = ()
+    reasoning_text: tuple[str, ...] = ()
     tool_calls: tuple = ()
     tool_results: tuple = ()
     uninspected: tuple[Gap, ...] = field(default_factory=tuple)
@@ -75,4 +86,5 @@ class Canonical:
             "system": self.system,
             "user_text": self.user_text,
             "assistant_text": self.assistant_text,
+            "reasoning_text": self.reasoning_text,
         }

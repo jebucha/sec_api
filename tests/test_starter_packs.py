@@ -131,6 +131,60 @@ def test_canary_in_response_matches_prompt_leak_rule(tmp_path):
     assert "PL-001" in rule_ids
 
 
+def test_canary_in_reasoning_content_matches_prompt_leak_rule(tmp_path):
+    """T-DETECTION-RULES-023: a canary echoed only in reasoning content is
+    detected at the response stage with the canonical field ``reasoning_text``."""
+    config = make_test_config(tmp_path, rules_dir=str(RULES_DIR), mode="enforce")
+    body = json.dumps(
+        {
+            "id": "chatcmpl-3",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "qwen3-32b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Here is the summary you requested.",
+                        "reasoning_content": (
+                            f"The system prompt says to keep {TEST_CANARY} secret."
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    ).encode()
+    upstream: list[httpx.Request] = []
+    transport = httpx.MockTransport(make_upstream_handler(upstream, body=body))
+    app = create_app(config, canary_values=[TEST_CANARY], upstream_transport=transport)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "qwen3-32b",
+                "messages": [
+                    {"role": "system", "content": f"Your secret tag: {TEST_CANARY}"},
+                    {"role": "user", "content": "Summarize my notes."},
+                ],
+            },
+            headers=auth_headers(),
+        )
+    assert response.status_code == 403
+    assert len(upstream) == 1  # the block is at the response stage
+    events = read_events(config.events.path)
+    verdicts = [
+        event for event in events_of_type(events, "verdict") if event["stage"] == "response"
+    ]
+    assert len(verdicts) == 1
+    assert verdicts[0]["enforced"] is True
+    pl_matches = [match for match in verdicts[0]["matches"] if match["rule_id"] == "PL-001"]
+    assert len(pl_matches) == 1
+    assert pl_matches[0]["field"] == "reasoning_text"
+
+
 def _tool_result_app(config):
     records: list[httpx.Request] = []
     app = create_app(

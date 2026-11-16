@@ -366,6 +366,65 @@ def test_flag_policy_forwards_image_and_records_event(tmp_path):
     assert [gap["kind"] for gap in gaps] == ["image"]
 
 
+def test_duplicate_gaps_collapse_into_one_event_with_count(tmp_path):
+    """T-CONTENT-NORMALIZATION-031: 20 identical stream gaps -> one event, count 20."""
+    config = make_test_config(tmp_path)  # monitor mode streams through the tee
+    ensure_rules_dir(config)
+    chunk = b'data: {"choices":[{"delta":{"mystery":"x"}}]}\n\n'
+    body = chunk * 20 + b"data: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=body
+        )
+
+    app = create_app(config, upstream_transport=httpx.MockTransport(handler))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={**CHAT_BODY, "stream": True},
+            headers=auth_headers(),
+        )
+    assert response.status_code == 200
+    gaps = events_of_type(read_events(config.events.path), "uninspected_content")
+    assert len(gaps) == 1
+    assert gaps[0]["kind"] == "unknown_part"
+    assert gaps[0]["location"] == "choices[0].delta"
+    assert gaps[0]["stage"] == "response"
+    assert gaps[0]["count"] == 20
+
+
+def test_distinct_gaps_emit_separate_events_with_count_one(tmp_path):
+    """T-CONTENT-NORMALIZATION-032: gaps with different locations stay separate."""
+    config = make_test_config(tmp_path)
+    ensure_rules_dir(config)
+    records: list[httpx.Request] = []
+    app = create_app(
+        config, upstream_transport=httpx.MockTransport(make_upstream_handler(records))
+    )
+    body = {
+        "model": "qwen3-32b",
+        "tools": [{"type": "function"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image_url", "image_url": {}},
+                ],
+            }
+        ],
+    }
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=body, headers=auth_headers())
+    assert response.status_code == 200
+    gaps = events_of_type(read_events(config.events.path), "uninspected_content")
+    assert [(gap["kind"], gap["location"], gap["stage"], gap["count"]) for gap in gaps] == [
+        ("image", "messages[0].content[1]", "request", 1),
+        ("tool_definitions", "tools", "request", 1),
+    ]
+
+
 def test_tool_results_match_in_verdict_event_with_bounded_excerpt(tmp_path):
     """6.2: a tool_results match reaches the verdict event with its field name
     and an excerpt bounded to ``excerpt_max_chars``."""

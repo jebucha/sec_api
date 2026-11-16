@@ -181,7 +181,7 @@ At startup the gateway SHALL start with whatever rules are valid, emitting `rule
 - **Pass**: exit code 0, no skipped tests
 
 ### Requirement: Starter rule packs
-The project SHALL ship starter rule packs covering prompt injection, jailbreak markers, secrets (e.g. cloud keys, VCS tokens, private key headers), PII (including Luhn-validated card numbers), unicode/encoding smuggling (tag characters, zero-width characters, long base64 runs), and a canary-token prompt-leak detector. The starter packs' prompt-injection, secrets, and PII rules SHALL target `tool_results` in addition to `user_text`, so payloads arriving in tool output (file contents, command output, web fetches) are detected by default; the jailbreak, smuggling, and canary-leak packs keep their current targets (design D6). Every starter rule SHALL include passing inline tests. Secrets and PII rules SHALL set `mask_excerpt: true`. The canary-token prompt-leak detector's inline tests reference the documented test-only canary value, so that rule loads only when that value is among the configured canary tokens (design D11); a deployment whose canary set omits it sees that one rule rejected with a `rule_rejected` event.
+The project SHALL ship starter rule packs covering prompt injection, jailbreak markers, secrets (e.g. cloud keys, VCS tokens, private key headers), PII (including Luhn-validated card numbers), unicode/encoding smuggling (tag characters, zero-width characters, long base64 runs), and a canary-token prompt-leak detector. The starter packs' prompt-injection, secrets, and PII rules SHALL target `tool_results` in addition to `user_text`, so payloads arriving in tool output (file contents, command output, web fetches) are detected by default; the jailbreak, smuggling, and canary-leak packs keep their current targets (inspect-tool-content design D6). The canary-token prompt-leak detector SHALL additionally target `reasoning_text`, so a canary echoed in the model's reasoning content is detected at the response stage (design D5). Every starter rule SHALL include passing inline tests. Secrets and PII rules SHALL set `mask_excerpt: true`. The canary-token prompt-leak detector's inline tests reference the documented test-only canary value, so that rule loads only when that value is among the configured canary tokens (design D11); a deployment whose canary set omits it sees that one rule rejected with a `rule_rejected` event.
 
 #### Scenario: Starter packs load clean
 - **GIVEN** the configured canary tokens include the documented test-only canary
@@ -215,4 +215,13 @@ The project SHALL ship starter rule packs covering prompt injection, jailbreak m
 - **ID**: T-DETECTION-RULES-022
 - **File**: tests/test_starter_packs.py::test_starter_rules_match_sensitive_data_in_tool_result
 - **Command**: `uv run pytest tests/test_starter_packs.py::test_starter_rules_match_sensitive_data_in_tool_result`
+- **Pass**: exit code 0, no skipped tests
+
+#### Scenario: Canary echoed in reasoning content detected
+- **GIVEN** a configured canary token is planted in a system prompt
+- **WHEN** an upstream response contains that canary token only in its reasoning content (e.g. `reasoning_content` or a `thinking` block), not in the visible answer
+- **THEN** the prompt-leak rule matches at the response stage with the canonical field `reasoning_text`
+- **ID**: T-DETECTION-RULES-023
+- **File**: tests/test_starter_packs.py::test_canary_in_reasoning_content_matches_prompt_leak_rule
+- **Command**: `uv run pytest tests/test_starter_packs.py::test_canary_in_reasoning_content_matches_prompt_leak_rule`
 - **Pass**: exit code 0, no skipped tests

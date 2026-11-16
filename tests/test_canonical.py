@@ -10,6 +10,7 @@ def test_canonical_fields_match_the_contract():
         "system",
         "user_text",
         "assistant_text",
+        "reasoning_text",
         "tool_calls",
         "tool_results",
     }
@@ -20,6 +21,7 @@ def test_canonical_defaults_are_empty():
     assert c.system == ()
     assert c.user_text == ()
     assert c.assistant_text == ()
+    assert c.reasoning_text == ()
     assert c.tool_calls == ()
     assert c.tool_results == ()
     assert c.uninspected == ()

@@ -22,7 +22,7 @@ VALID_STAGES = ("request", "response")
 VALID_FORMATS = ("openai", "anthropic")
 
 # Canonical fields that carry text segments in v1.
-TEXT_FIELDS = ("system", "user_text", "assistant_text")
+TEXT_FIELDS = ("system", "user_text", "assistant_text", "reasoning_text")
 
 REQUIRED_FIELDS = ("id", "text", "label", "category")
 OPTIONAL_FIELDS = ("expected_rules", "field", "stage", "format")

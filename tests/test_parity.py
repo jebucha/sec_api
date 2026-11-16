@@ -59,6 +59,37 @@ def test_identical_responses_yield_identical_canonical_fields():
     assert oai_canon.assistant_text == ant_canon.assistant_text == ("The answer is 4.",)
 
 
+def test_identical_reasoning_content_yields_identical_canonical_field():
+    """T-CONTENT-NORMALIZATION-029: one unit of reasoning, both formats."""
+    oai_body = json.dumps(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "The answer is 4.",
+                        "reasoning_content": "I should add 2 and 2.",
+                    }
+                }
+            ]
+        }
+    ).encode()
+    ant_body = json.dumps(
+        {
+            "content": [
+                {"type": "thinking", "thinking": "I should add 2 and 2."},
+                {"type": "text", "text": "The answer is 4."},
+            ]
+        }
+    ).encode()
+
+    oai_canon = openai.parse_response(oai_body)
+    ant_canon = anthropic.parse_response(ant_body)
+    assert oai_canon.reasoning_text == ant_canon.reasoning_text
+    assert oai_canon.reasoning_text == ("I should add 2 and 2.",)
+    assert oai_canon.assistant_text == ant_canon.assistant_text == ("The answer is 4.",)
+
+
 def test_identical_tool_content_yields_identical_canonical_fields():
     """T-CONTENT-NORMALIZATION-024: one tool call + one tool result, both formats."""
     oai_body = json.dumps(
