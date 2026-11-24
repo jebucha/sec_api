@@ -15,7 +15,7 @@ services:
       # Rules and config are read-only; only the events dir is writable.
       - ./rules:/rules:ro
       - ./config/gateway.yaml:/config/gateway.yaml:ro
-      - llmgw-events:/var/log/llmgw
+      - ./llmgw-events:/var/log/llmgw
     secrets:
       - vllm-key
     # Podman ignores the image-level HEALTHCHECK (OCI format); repeat it at
